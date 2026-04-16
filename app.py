@@ -8,10 +8,10 @@ import re
 from scipy.stats import t
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Labomed Stats Suite", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="LM Stats Suite", page_icon="🔬", layout="wide")
 
 # --- MASTER NAVIGATION SIDEBAR ---
-st.sidebar.title("🔬 Labomed Stats")
+st.sidebar.title("🔬 LM Stats")
 st.sidebar.markdown("Select a tool below:")
 
 app_selection = st.sidebar.radio("Navigation", [
