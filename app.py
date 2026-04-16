@@ -11,7 +11,7 @@ from scipy.stats import t
 st.set_page_config(page_title="Labomed Stats Suite", page_icon="🔬", layout="wide")
 
 # ==========================================
-# SHARED HELPERS (Used by all Apps)
+# SHARED HELPERS (Available to all Apps)
 # ==========================================
 
 def display_formal_table(df, caption, decimals=3, custom_headers=None):
@@ -143,70 +143,92 @@ elif app_selection == "02 - Linear Regression Intervals":
         sns.set_theme(style="white")
         fig, ax = plt.subplots()
         ax.plot(df_reg['x'], df_reg['y'], 'ko', label="Data")
-        ax.plot(grid_x, grid_res['fit'], 'k-', label="Fit")
-        if interval_type in ['ci', 'both']: ax.fill_between(grid_x, grid_res['ci_lower'], grid_res['ci_upper'], alpha=0.2, label="CI")
-        if interval_type in ['pi', 'both']: ax.plot(grid_x, grid_res['pi_upper'], 'r--', label="PI")
-        ax.legend()
+        ax.plot(grid_x, grid_res['fit'], 'k-')
+        if interval_type in ['ci', 'both']: ax.fill_between(grid_x, grid_res['ci_lower'], grid_res['ci_upper'], alpha=0.2)
+        if interval_type in ['pi', 'both']: ax.plot(grid_x, grid_res['pi_upper'], 'r--')
         st.pyplot(fig)
         
         pred_pts = [float(p) for p in pred_in.split() if p.strip()]
         all_x = sorted(list(set(df_reg['x'].tolist() + pred_pts)))
         final_df = predict_intervals(model, np.array(all_x), conf, side)
         final_df = pd.merge(pd.DataFrame({"x": all_x}), df_reg, on="x", how="left").merge(final_df, on="x")
-        display_formal_table(final_df, "Table 1: Regression Analysis", decimals)
+        display_formal_table(final_df, "Regression Analysis Results", decimals)
 
 # ==========================================
 # APP 03: SHELF LIFE ESTIMATOR
 # ==========================================
 elif app_selection == "03 - Shelf Life Estimator":
     st.title("⏳ App 03 - Shelf Life Estimator")
+    st.markdown("Estimate shelf life based on ICH Q1E guidelines.")
+
     c1, c2 = st.columns([2, 1])
-    with c1: data_in = st.text_area("Stability Data", "0\t100\n3\t99.2\n6\t98.4\n9\t97.8\n12\t97.0\n18\t95.6\n24\t94.8")
-    with c2: pred_in = st.text_area("Future Points", "30\n36\n48")
+    with c1: data_in = st.text_area("Stability Data (Time | Response)", "0\t100\n3\t99.2\n6\t98.4\n9\t97.8\n12\t97.0\n18\t95.6\n24\t94.8", height=150)
+    with c2: pred_in = st.text_area("Future Points", "30\n36\n48", height=150)
+
     col1, col2, col3 = st.columns(3)
-    with col1: side = st.selectbox("Spec Side", ["lower", "upper"])
+    with col1: spec_side = st.selectbox("Spec Side", ["lower", "upper"])
     with col2: basis = st.selectbox("Basis", ["ci", "pi", "fit"])
     with col3: limit = st.number_input("Spec Limit", value=90.0)
+    
     conf = st.slider("Confidence (1-sided)", 0.80, 0.99, 0.95)
     decimals = st.slider("Decimals", 1, 8, 4)
 
-    if st.button("Calculate"):
-        df_sl = parse_pasted_data(data_in)
-        df_sl.columns = ['x', 'y']
-        model = fit_linear_model(df_sl['x'], df_sl['y'])
-        grid_x = np.linspace(0, max(df_sl['x'].max()*2, 48), 1000)
-        res = predict_intervals(model, grid_x, conf, "upper" if side=="upper" else "lower")
-        
-        bound_col = "fit" if basis == "fit" else ("ci_lower" if side == "lower" else "ci_upper") if basis == "ci" else ("pi_lower" if side == "lower" else "pi_upper")
-        
-        # Simple crossing logic
-        def find_cross(xv, yv, lim):
-            for i in range(len(yv)-1):
-                if (yv[i]-lim)*(yv[i+1]-lim) <= 0:
-                    return xv[i] + (lim - yv[i]) * (xv[i+1]-xv[i])/(yv[i+1]-yv[i])
-            return None
-        
-        sl = find_cross(grid_x, res[bound_col].values, limit)
-        
-        fig, ax = plt.subplots()
-        ax.plot(df_sl['x'], df_sl['y'], 'ko')
-        ax.plot(grid_x, res['fit'], 'k-')
-        ax.plot(grid_x, res[bound_col], 'r-', label="Shelf Life Bound")
-        ax.axhline(limit, color='g', ls='--')
-        if sl: ax.axvline(sl, color='g', ls=':')
-        st.pyplot(fig)
-        
-        st.success(f"Estimated Shelf Life: {f'{sl:.2f}' if sl else 'Not reached'}")
-        
-        pts = [float(p) for p in pred_in.split() if p.strip()]
-        all_x = sorted(list(set(df_sl['x'].tolist() + pts)))
-        table_res = predict_intervals(model, np.array(all_x), conf, "two-sided")
-        final_df = pd.merge(pd.DataFrame({"x": all_x}), df_sl, on="x", how="left").merge(table_res, on="x")
-        display_formal_table(final_df, "Table 1: Stability Details", decimals)
+    if st.button("Calculate Shelf Life"):
+        try:
+            df_sl = parse_pasted_data(data_in)
+            df_sl.columns = ['x', 'y']
+            model = fit_linear_model(df_sl['x'], df_sl['y'])
+            
+            # Predict range for crossing
+            grid_x = np.linspace(0, max(df_sl['x'].max()*3, 48), 1000)
+            res = predict_intervals(model, grid_x, conf, side="upper" if spec_side=="upper" else "lower")
+            
+            bound_col = "fit" if basis == "fit" else ("ci_lower" if spec_side == "lower" else "ci_upper") if basis == "ci" else ("pi_lower" if spec_side == "lower" else "pi_upper")
+            
+            def find_cross(xv, yv, lim):
+                for i in range(len(yv)-1):
+                    if (yv[i]-lim)*(yv[i+1]-lim) <= 0:
+                        return xv[i] + (lim - yv[i]) * (xv[i+1]-xv[i])/(yv[i+1]-yv[i])
+                return None
+            
+            sl = find_cross(grid_x, res[bound_col].values, limit)
+
+            # --- PLOTTING ---
+            sns.set_theme(style="white")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.fill_between(grid_x, res['ci_lower'], res['ci_upper'], color="#3498db", alpha=0.15, label="95% CI")
+            ax.plot(df_sl['x'], df_sl['y'], 'ko', label="Data")
+            ax.plot(grid_x, res['fit'], 'k-', label="Trend")
+            ax.plot(grid_x, res[bound_col], color="#e74c3c", linewidth=2.5, label="Shelf-life Bound")
+            ax.axhline(limit, color="#27ae60", linestyle="--")
+            
+            if sl:
+                ax.axvline(sl, color="#27ae60", linestyle=":")
+                ax.text(sl, ax.get_ylim()[0], f" {sl:.2f}", color="#27ae60", weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+            
+            ax.text(ax.get_xlim()[0], limit, f" Limit: {limit}", color="#27ae60", weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+            sns.despine()
+            st.pyplot(fig)
+
+            st.markdown(f"""
+            <div style="border-left: 4px solid #2980b9; padding: 15px; background-color: #f8f9fa; margin-top: 20px;">
+                <b>Estimated Shelf Life:</b> <span style="font-size:20px; color:#27ae60; font-weight:bold;">{f'{sl:.2f} units' if sl else 'Not reached'}</span><br>
+                <b>R²:</b> {model['r2']:.4f} | <b>Residual SD:</b> {model['s']:.4f}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # --- TABLE ---
+            pts = [float(p) for p in pred_in.split() if p.strip()]
+            all_x = sorted(list(set(df_sl['x'].tolist() + pts)))
+            table_res = predict_intervals(model, np.array(all_x), conf, side="upper" if spec_side=="upper" else "lower")
+            final_df = pd.merge(pd.DataFrame({"x": all_x}), df_sl, on="x", how="left").merge(table_res, on="x")
+            display_formal_table(final_df, "Table 1: Stability Study Data & Bounds", decimals)
+
+        except Exception as e: st.error(f"Error: {e}")
 
 # ==========================================
 # PLACEHOLDERS
 # ==========================================
 else:
     st.title(app_selection)
-    st.info("Module logic pending...")
+    st.info("Logic for this module is pending integration.")
