@@ -381,12 +381,132 @@ elif app_selection == "02 - Linear Regression Intervals":
         except Exception as e:
             st.error(f"Error: {e}")
 
+
 # ==========================================
 # APP 03: SHELF LIFE ESTIMATOR
 # ==========================================
 elif app_selection == "03 - Shelf Life Estimator":
-    st.title("📈 App 03 - Shelf Life Estimator")
-    st.info("We will paste the code for this app here next!")
+    st.title("⏳ App 03 - Shelf Life Estimator")
+    st.markdown("Estimate shelf life based on ICH Q1E guidelines using Fit, CI, or PI crossings.")
+
+    # --- Helper Functions for App 03 ---
+    def sl_to_numeric(series):
+        return pd.to_numeric(series.astype(str).str.strip().str.replace("%", "", regex=False), errors="coerce")
+
+    def sl_parse_xy_data(text):
+        text = str(text).strip()
+        if not text: raise ValueError("Paste Time and Response data.")
+        parsers = [lambda s: pd.read_csv(StringIO(s), sep="\t", header=None, engine="python"), lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python")]
+        df = None
+        for parser in parsers:
+            try:
+                trial = parser(text)
+                if trial.shape[1] >= 2:
+                    df = trial.iloc[:, :2].copy()
+                    break
+            except: pass
+        if df is None: raise ValueError("Could not read columns.")
+        df.columns = ["x", "y"]
+        if sl_to_numeric(df.iloc[0]).isna().any(): df = df.iloc[1:].reset_index(drop=True)
+        df["x"] = sl_to_numeric(df["x"])
+        df["y"] = sl_to_numeric(df["y"])
+        return df.dropna().sort_values("x").reset_index(drop=True)
+
+    def sl_fit_linear(x, y):
+        n = len(x)
+        X = np.column_stack([np.ones(n), x])
+        XtX_inv = np.linalg.inv(X.T @ X)
+        beta = XtX_inv @ (X.T @ y)
+        fitted = X @ beta
+        resid = y - fitted
+        df_deg = n - 2
+        s = np.sqrt(np.sum(resid**2) / df_deg)
+        r2 = 1 - (np.sum(resid**2) / np.sum((y - np.mean(y))**2))
+        return {"intercept": beta[0], "slope": beta[1], "XtX_inv": XtX_inv, "s": s, "df": df_deg, "r2": r2}
+
+    def sl_predict(model, x_values, confidence=0.95):
+        Xg = np.column_stack([np.ones(len(x_values)), x_values])
+        fit = Xg @ np.array([model["intercept"], model["slope"]])
+        h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
+        tcrit = t.ppf(confidence, model["df"]) # One-sided per ICH
+        ci_lower, ci_upper = fit - tcrit * model["s"] * np.sqrt(h), fit + tcrit * model["s"] * np.sqrt(h)
+        pi_lower, pi_upper = fit - tcrit * model["s"] * np.sqrt(1 + h), fit + tcrit * model["s"] * np.sqrt(1 + h)
+        return pd.DataFrame({"x": x_values, "fit": fit, "ci_lower": ci_lower, "ci_upper": ci_upper, "pi_lower": pi_lower, "pi_upper": pi_upper})
+
+    def sl_find_crossing(xv, yv, limit):
+        d = yv - limit
+        for i in range(len(d) - 1):
+            if d[i] * d[i + 1] <= 0:
+                return xv[i] + (limit - yv[i]) * (xv[i+1] - xv[i]) / (yv[i+1] - yv[i])
+        return None
+
+    # --- UI LAYOUT ---
+    c1, c2 = st.columns([2, 1])
+    with c1: data_in = st.text_area("Stability Data (Time | Response)", value="0\t100\n3\t99.2\n6\t98.4\n9\t97.8\n12\t97.0\n18\t95.6\n24\t94.8", height=150)
+    with c2: pred_in = st.text_area("Future Timepoints", value="30\n36\n48", height=150)
+
+    col1, col2, col3 = st.columns(3)
+    with col1: spec_side = st.selectbox("Spec Side", ["lower", "upper"])
+    with col2: basis = st.selectbox("Shelf-life Basis", [("Confidence Bound", "ci"), ("Prediction Bound", "pi"), ("Fit Line", "fit")], format_func=lambda x: x[0])[1]
+    with col3: conf_val = st.slider("Confidence Level", 0.80, 0.99, 0.95)
+
+    col4, col5, col6 = st.columns(3)
+    with col4: spec_limit = st.number_input("Spec Limit Value", value=90.0)
+    with col5: spec_label = st.text_input("Spec Label", value="Lower Spec")
+    with col6: decimals = st.slider("Decimals Display", 1, 8, 4)
+
+    if st.button("Calculate Shelf Life", type="primary"):
+        try:
+            df = sl_parse_xy_data(data_in)
+            model = sl_fit_linear(df["x"], df["y"])
+            grid_x = np.linspace(0, max(df["x"].max() * 2, 48), 1000)
+            grid_df = sl_predict(model, grid_x, confidence=conf_val)
+            
+            bound_col = "fit" if basis == "fit" else ("ci_lower" if spec_side == "lower" else "ci_upper") if basis == "ci" else ("pi_lower" if spec_side == "lower" else "pi_upper")
+            shelf_life = sl_find_crossing(grid_x, grid_df[bound_col].values, spec_limit)
+
+            # --- PLOTTING ---
+            sns.set_theme(style="white")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color="#3498db", alpha=0.15, label="95% CI (One-sided)")
+            ax.plot(df["x"], df["y"], 'ko', label="Data", markersize=6)
+            ax.plot(grid_df["x"], grid_df["fit"], 'k-', linewidth=1.5, label="Trend")
+            ax.plot(grid_df["x"], grid_df[bound_col], color="#e74c3c", linewidth=2.5, label=f"Shelf-life Bound ({basis.upper()})")
+            ax.axhline(spec_limit, color="#27ae60", linestyle="--", linewidth=1.5)
+            
+            if shelf_life:
+                ax.axvline(shelf_life, color="#27ae60", linestyle=":", linewidth=1.5)
+                ax.text(shelf_life, plt.ylim()[0]+1, f" {shelf_life:.2f}", color="#27ae60", weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+            ax.text(ax.get_xlim()[0]+1, spec_limit, f" {spec_label}: {spec_limit}", color="#27ae60", weight="bold", va="bottom", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+            
+            plt.title("Shelf Life Estimation Plot", fontsize=14, weight="bold")
+            sns.despine()
+            st.pyplot(fig)
+
+            # --- SUMMARY BOX ---
+            res_color = "#27ae60" if shelf_life else "#e74c3c"
+            st.markdown(f"""
+            <div style="border-left: 4px solid #2980b9; padding: 15px; background-color: #f8f9fa; margin-top: 20px;">
+                <h4 style="margin:0">Analysis Results</h4>
+                <b>Regression:</b> y = {model['intercept']:.{decimals}f} + ({model['slope']:.{decimals}f}) * x <br>
+                <b>R²:</b> {model['r2']:.{decimals}f} | <b>Residual SD:</b> {model['s']:.{decimals}f}<br>
+                <span style="font-size:18px; color:{res_color}; font-weight:bold;">Estimated Shelf Life: {f"{shelf_life:.2f} units" if shelf_life else "Not reached"}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # --- TABLES ---
+            st.write("### Data & Predictions")
+            pred_pts = [float(p.strip()) for p in pred_in.split() if p.strip()]
+            all_x = sorted(list(set(df["x"].tolist() + pred_pts)))
+            final_df = pd.merge(pd.DataFrame({"x": all_x}), df, on="x", how="left")
+            intervals = sl_predict(model, np.array(all_x), confidence=conf_val)
+            report_df = pd.merge(final_df, intervals, on="x")
+            
+            headers = {"x": "Time", "y": "Actual", "fit": "Fitted", "ci_lower": "Lower CI", "ci_upper": "Upper CI", "pi_lower": "Lower PI", "pi_upper": "Upper PI"}
+            display_formal_table(report_df, "Table 1: Stability Study Details", decimals, headers)
+
+        except Exception as e: st.error(f"Error: {e}")
 
 # ==========================================
 # APP 04: DISSOLUTION COMPARISON
