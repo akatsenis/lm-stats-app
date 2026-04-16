@@ -33,7 +33,6 @@ st.sidebar.info("Upload or paste data directly from Excel into the tools.")
 # ==========================================
     
 if app_selection == "01 - Descriptive Statistics":
-    
     @st.cache_data
     def parse_pasted_data(text):
         if not text.strip(): return None
