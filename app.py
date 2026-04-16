@@ -31,6 +31,7 @@ st.sidebar.info("Upload or paste data directly from Excel into the tools.")
 # ==========================================
 # APP 01: DESCRIPTIVE STATISTICS
 # ==========================================
+    
 if app_selection == "01 - Descriptive Statistics":
     
     @st.cache_data
