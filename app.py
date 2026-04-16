@@ -15,16 +15,15 @@ st.sidebar.title("🔬 Labomed Stats")
 st.sidebar.markdown("Select a tool below:")
 
 app_selection = st.sidebar.radio("Navigation", [
-    "01 - Descriptive Statistics",
-    "02 - Linear Regression Intervals",
-    "03 - Shelf Life Estimator",
-    "04 - Dissolution Comparison (f2)",
-    "05 - Two-Sample Tests",
-    "06 - Two-Way ANOVA",
-    "07 - Tolerance & Confidence Intervals",
-    "08 - PCA Analysis",
-    "09 - Design of Experiments (DOE)"
-])
+    "01 - Descriptive Statistics",
+    "02 - Linear Regression Intervals",
+    "03 - Shelf Life Estimator",
+    "04 - Dissolution Comparison (f2)",
+    "05 - Two-Sample Tests",
+    "06 - Two-Way ANOVA",
+    "07 - Tolerance & Confidence Intervals",
+    "08 - PCA Analysis",
+    "09 - Design of Experiments (DOE)"
 
 st.sidebar.divider()
 st.sidebar.info("Upload or paste data directly from Excel into the tools.")
