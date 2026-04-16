@@ -455,4 +455,3 @@ elif app_selection == "09 - Design of Experiments (DOE)":
     
     if generate_btn: st.info("Design Matrix generation logic will go here once you provide the Python code!")
     if analyze_btn: st.info("Response Analysis and plotting logic will go here once you provide the Python code!")
-
