@@ -1,18 +1,3 @@
-This is coming together perfectly! We are going to slot **Linear Regression Intervals** into the **App 02** position, and bump every other app down by one number. 
-
-I have fully translated the Colab/ipywidgets regression code into native Streamlit components. The inputs are now cleanly arranged in columns, the plot renders natively in the web app, and the APA-style HTML tables are fully supported.
-
-### How to update your app
-1. Go to your repository on **[GitHub.com](https://github.com/)**.
-2. Click on the **`app.py`** file to open it.
-3. Click the **Pencil icon** ✏️ to edit it.
-4. **Delete everything** currently in the file.
-5. **Paste the updated Master Structure below.**
-6. Click **Commit changes**.
-
-Here is your updated `app.py` file with the new numbering and the fully functional App 02 built in:
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -300,7 +285,7 @@ elif app_selection == "02 - Linear Regression Intervals":
         sns.despine()
         ax.legend(frameon=False, loc="best")
         plt.tight_layout()
-        st.pyplot(fig) # Render the plot in Streamlit
+        st.pyplot(fig) 
         return crossing_x
 
     def parse_optional_float(txt):
@@ -357,11 +342,9 @@ elif app_selection == "02 - Linear Regression Intervals":
                 model = fit_linear_model(data_df["x"], data_df["y"])
                 grid_df = predict_with_intervals(model, grid_x, confidence=conf_val, side=side_val)
 
-                # RENDER PLOT FIRST
                 st.markdown("### Regression Plot")
                 crossing_x = plot_regression(data_df, model, grid_df, conf_val, interval_val, side_val, title_val, xlab_val, ylab_val, point_val, y_suff_val, spec_en_val, parse_optional_float(spec_limit_val) if spec_en_val else None, spec_label_val, cross_val)
 
-                # HTML SUMMARY BOX
                 eq_html = f"""
                 <div style="border-left: 4px solid #2980b9; padding: 10px 15px; background-color: #f8f9fa; margin-bottom: 20px;">
                     <h4 style="margin-top: 0;">Regression Model Summary</h4>
@@ -375,7 +358,6 @@ elif app_selection == "02 - Linear Regression Intervals":
                 eq_html += "</div>"
                 st.markdown(eq_html, unsafe_allow_html=True)
 
-                # TABLES
                 st.markdown("<br>", unsafe_allow_html=True)
                 display_formal_table(data_df, "Table 1: Parsed Input Data", decimals_val)
 
@@ -473,4 +455,3 @@ elif app_selection == "09 - Design of Experiments (DOE)":
     
     if generate_btn: st.info("Design Matrix generation logic will go here once you provide the Python code!")
     if analyze_btn: st.info("Response Analysis and plotting logic will go here once you provide the Python code!")
-```
