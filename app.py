@@ -831,21 +831,21 @@ if app_selection == "01 - Descriptive Statistics":
             except Exception:
                 sr = None
 
-if sr is not None and sr.size == 2 and np.all(np.isfinite(sr)):
-    ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
-    ax.axvline(sr[0], color="#ef4444", ls=":", lw=1.2)
-    ax.axvline(sr[1], color="#ef4444", ls=":", lw=1.2)
-    if shade_label:
-        ax.text(
-            np.mean(sr),
-            4.92,
-            shade_label,
-            ha="center",
-            va="bottom",
-            fontsize=10,
-            color="#b91c1c",
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2),
-        )
+        if sr is not None and sr.size == 2 and np.all(np.isfinite(sr)):
+            ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
+            ax.axvline(sr[0], color="#ef4444", ls=":", lw=1.2)
+            ax.axvline(sr[1], color="#ef4444", ls=":", lw=1.2)
+        if shade_label:
+            ax.text(
+                np.mean(sr),
+                4.92,
+                shade_label,
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                color="#b91c1c",
+                bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2),
+                )
             ax.axvspan(shaded_range[0], shaded_range[1], color="#ef4444", alpha=0.10)
             ax.axvline(shaded_range[0], color="#ef4444", ls=":", lw=1.2)
             ax.axvline(shaded_range[1], color="#ef4444", ls=":", lw=1.2)
