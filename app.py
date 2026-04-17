@@ -825,7 +825,7 @@ if app_selection == "01 - Descriptive Statistics":
         row_names = ["Mean ± SD", "95% CI for mean", "IQR / median", "Range", f"{tol_cov}%/{tol_conf}% tolerance interval"]
 
         sr = None
-if shaded_range is not None:
+        if shaded_range is not None:
     try:
         sr = np.asarray(shaded_range, dtype=float).ravel()
     except Exception:
