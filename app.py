@@ -903,7 +903,7 @@ if app_selection == "01 - Descriptive Statistics":
                     ax.plot(s["mean"], yy, 'o', color=col, ms=6)
 
         ax.set_xlim(x_lo, x_hi)
-        ax.set_ylim(0.4, 6.6)
+        ax.set_ylim(0.4, 7)
         ax.set_yticks([density_y0] + row_centers)
         ax.set_yticklabels(["Normal distribution"] + row_names)
         ax.set_title(title)
