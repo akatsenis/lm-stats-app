@@ -694,61 +694,417 @@ def doe_formula(safe_factors, model_type="interaction"):
 # App 01 Descriptive Statistics
 # -------------------------------------------------
 if app_selection == "01 - Descriptive Statistics":
-    app_header("📊 App 01 - Descriptive Statistics", "Paste a table from Excel, choose variables and grouping columns, and generate report-ready summaries.")
+    app_header("📊 App 01 - Descriptive Statistics", "Paste one or more numeric columns with headers. For one column, get a graphical summary. For multiple columns, choose a reference and a test column to compare.")
+
     data_input = st.text_area("Data (paste with headers)", height=220)
     decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="desc_dec")
+    alpha = st.slider("Significance level α", 0.001, 0.100, 0.050, 0.001, key="desc_alpha")
+    mean_ci_conf = st.slider("Mean CI confidence (%)", 80, 99, 95, 1, key="desc_mean_ci")
+    tol_cov = st.slider("Tolerance interval coverage (%)", 80, 99, 99, 1, key="desc_tol_cov")
+    tol_conf = st.slider("Tolerance interval confidence (%)", 80, 99, 95, 1, key="desc_tol_conf")
+
+    def _one_sample_summary(arr, label, ci_conf=0.95, tol_p=0.99, tol_confidence=0.95):
+        arr = np.asarray(arr, dtype=float)
+        n = len(arr)
+        mean = np.mean(arr)
+        sd = np.std(arr, ddof=1) if n > 1 else np.nan
+        se = sd / np.sqrt(n) if n > 1 else np.nan
+        tcrit = t.ppf(1 - (1 - ci_conf) / 2, n - 1) if n > 1 else np.nan
+        ci_half = tcrit * se if n > 1 else np.nan
+        _, tol_lower, tol_upper = tolerance_interval_normal(arr, p=tol_p, conf=tol_confidence, two_sided=True)
+        ad_stat, ad_p = normal_ad(arr) if n >= 8 else (np.nan, np.nan)
+        try:
+            sh_stat, sh_p = stats.shapiro(arr) if 3 <= n <= 5000 else (np.nan, np.nan)
+        except Exception:
+            sh_stat, sh_p = (np.nan, np.nan)
+        q1, med, q3 = np.percentile(arr, [25, 50, 75])
+        return {
+            "label": label,
+            "n": n,
+            "sum": np.sum(arr),
+            "mean": mean,
+            "sd": sd,
+            "var": np.var(arr, ddof=1) if n > 1 else np.nan,
+            "min": np.min(arr),
+            "q1": q1,
+            "median": med,
+            "q3": q3,
+            "max": np.max(arr),
+            "ci_half": ci_half,
+            "ci_lower": mean - ci_half if pd.notna(ci_half) else np.nan,
+            "ci_upper": mean + ci_half if pd.notna(ci_half) else np.nan,
+            "tol_lower": tol_lower,
+            "tol_upper": tol_upper,
+            "ad_stat": ad_stat,
+            "ad_p": ad_p,
+            "shapiro_stat": sh_stat,
+            "shapiro_p": sh_p,
+        }
+
+    def _f_test_equal_var(a, b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        v1 = np.var(a, ddof=1)
+        v2 = np.var(b, ddof=1)
+        if np.isnan(v1) or np.isnan(v2) or v1 == 0 or v2 == 0:
+            return np.nan, np.nan
+        if v1 >= v2:
+            fstat = v1 / v2
+            dfn, dfd = len(a) - 1, len(b) - 1
+        else:
+            fstat = v2 / v1
+            dfn, dfd = len(b) - 1, len(a) - 1
+        p = 2 * min(stats.f.cdf(fstat, dfn, dfd), 1 - stats.f.cdf(fstat, dfn, dfd))
+        return fstat, min(p, 1.0)
+
+    def _anova_two_groups(a, b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        n1, n2 = len(a), len(b)
+        allv = np.concatenate([a, b])
+        grand = np.mean(allv)
+        m1, m2 = np.mean(a), np.mean(b)
+        ss_between = n1 * (m1 - grand) ** 2 + n2 * (m2 - grand) ** 2
+        ss_within = np.sum((a - m1) ** 2) + np.sum((b - m2) ** 2)
+        ss_total = np.sum((allv - grand) ** 2)
+        df_between = 1
+        df_within = n1 + n2 - 2
+        df_total = n1 + n2 - 1
+        ms_between = ss_between / df_between
+        ms_within = ss_within / df_within if df_within > 0 else np.nan
+        f_stat = ms_between / ms_within if ms_within and ms_within > 0 else np.nan
+        p = 1 - stats.f.cdf(f_stat, df_between, df_within) if pd.notna(f_stat) else np.nan
+        return pd.DataFrame({
+            "Source of Variation": ["Between Groups", "Within Groups", "Total"],
+            "SS": [ss_between, ss_within, ss_total],
+            "df": [df_between, df_within, df_total],
+            "MS": [ms_between, ms_within, np.nan],
+            "F": [f_stat, np.nan, np.nan],
+            "P-Value": [p, np.nan, np.nan],
+        }), ms_within, ss_between, ss_total
+
+    def _acceptance_band(ref, test, alpha_level=0.05):
+        ref = np.asarray(ref, dtype=float)
+        test = np.asarray(test, dtype=float)
+        n1, n2 = len(ref), len(test)
+        m1 = np.mean(ref)
+        v1 = np.var(ref, ddof=1)
+        v2 = np.var(test, ddof=1)
+        sp2 = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+        se_diff = np.sqrt((1 / n1 + 1 / n2) * sp2)
+        tcrit = t.ppf(1 - alpha_level / 2, n1 + n2 - 2)
+        return m1 - tcrit * se_diff, m1 + tcrit * se_diff
+
+    def _graphical_summary_figure(stats_list, title, shaded_range=None, shaded_label=None):
+        colors = ["#d62728", "#111111"] if len(stats_list) > 1 else [PRIMARY_COLOR]
+        labels = [s["label"] for s in stats_list]
+        mins = [s["min"] for s in stats_list] + [s["tol_lower"] for s in stats_list if pd.notna(s["tol_lower"])]
+        maxs = [s["max"] for s in stats_list] + [s["tol_upper"] for s in stats_list if pd.notna(s["tol_upper"])]
+        x_min = min(mins)
+        x_max = max(maxs)
+        pad = 0.08 * (x_max - x_min if x_max > x_min else 1)
+        x_lo, x_hi = x_min - pad, x_max + pad
+
+        fig, (ax, axr) = plt.subplots(1, 2, figsize=(max(FIG_W * 1.8, 12), max(FIG_H * 1.35, 7)), gridspec_kw={"width_ratios": [1.45, 1]})
+
+        row_centers = [4.25, 3.35, 2.45, 1.55, 0.65]
+        row_names = ["Mean ± SD", "95% CI for mean", "IQR / median", "Range", f"{tol_cov}%/{tol_conf}% tolerance interval"]
+
+        if shaded_range is not None and all(pd.notna(shaded_range)):
+            ax.axvspan(shaded_range[0], shaded_range[1], color="#ef4444", alpha=0.10)
+            ax.axvline(shaded_range[0], color="#ef4444", ls=":", lw=1.2)
+            ax.axvline(shaded_range[1], color="#ef4444", ls=":", lw=1.2)
+            if shaded_label:
+                ax.text((shaded_range[0] + shaded_range[1]) / 2, 5.55, shaded_label, color="#b91c1c", ha="center", va="bottom", fontsize=9)
+
+        density_y0 = 5.0
+        xgrid = np.linspace(x_lo, x_hi, 500)
+        for i, s in enumerate(stats_list):
+            arr = s["raw"]
+            col = colors[i]
+            if len(np.unique(arr)) > 1 and len(arr) >= 3:
+                try:
+                    dens = gaussian_kde(arr)(xgrid)
+                    dens = dens / dens.max() * 0.85
+                except Exception:
+                    dens = np.zeros_like(xgrid)
+            else:
+                dens = np.zeros_like(xgrid)
+            ax.plot(xgrid, density_y0 + dens, color=col, lw=2)
+            ax.hlines(density_y0, x_lo, x_hi, color="#111827", lw=0.8)
+
+        offsets = [0.10, -0.10] if len(stats_list) > 1 else [0.0]
+        for ridx, yc in enumerate(row_centers):
+            ax.hlines(yc - 0.38, x_lo, x_hi, color="#d1d5db", lw=0.8)
+            for i, s in enumerate(stats_list):
+                yy = yc + offsets[i]
+                col = colors[i]
+                if ridx == 0:
+                    ax.hlines(yy, s["mean"] - s["sd"], s["mean"] + s["sd"], color=col, lw=1.6)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                elif ridx == 1:
+                    ax.hlines(yy, s["ci_lower"], s["ci_upper"], color=col, lw=1.8)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                elif ridx == 2:
+                    ax.hlines(yy, s["q1"], s["q3"], color=col, lw=2.0)
+                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                elif ridx == 3:
+                    ax.hlines(yy, s["min"], s["max"], color=col, lw=1.6)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=5)
+                else:
+                    ax.hlines(yy, s["tol_lower"], s["tol_upper"], color=col, lw=1.9)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=5)
+
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(0.2, 5.9)
+        ax.set_yticks(row_centers)
+        ax.set_yticklabels(row_names)
+        ax.set_title(title)
+        ax.grid(axis="x", alpha=GRID_ALPHA)
+        if SHOW_LEGEND:
+            handles = [plt.Line2D([0], [0], color=colors[i], marker='o', lw=2, label=labels[i]) for i in range(len(labels))]
+            ax.legend(handles=handles, frameon=False, loc=LEGEND_LOC)
+
+        axr.axis("off")
+        axr.set_title("Graphical Summary with Descriptive Statistics", fontsize=11, fontweight="bold", pad=10)
+        if len(stats_list) == 1:
+            s = stats_list[0]
+            rows = [
+                ("Normality (AD), p-value", fmt_p(s["ad_p"])),
+                ("Normality (Shapiro), p-value", fmt_p(s["shapiro_p"])),
+                ("Mean", s["mean"]),
+                ("SD", s["sd"]),
+                ("N", s["n"]),
+                ("Variance", s["var"]),
+                ("Minimum", s["min"]),
+                ("1st Quartile", s["q1"]),
+                ("Median", s["median"]),
+                ("3rd Quartile", s["q3"]),
+                ("Maximum", s["max"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s["tol_lower"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s["tol_upper"]),
+                (f"{mean_ci_conf}% LCI for Mean", s["ci_lower"]),
+                (f"{mean_ci_conf}% UCI for Mean", s["ci_upper"]),
+            ]
+            axr.text(0.60, 0.96, s["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            y = 0.90
+            for name, val in rows:
+                axr.text(0.03, y, name, ha="left", va="center", fontsize=9, fontweight="bold")
+                if isinstance(val, str):
+                    show = val
+                else:
+                    show = f"{val:.{decimals}f}"
+                axr.text(0.60, y, show, ha="center", va="center", fontsize=9)
+                y -= 0.055
+        else:
+            s1, s2 = stats_list
+            rows = [
+                ("Normality (AD), p-value", fmt_p(s1["ad_p"]), fmt_p(s2["ad_p"])),
+                ("Normality (Shapiro), p-value", fmt_p(s1["shapiro_p"]), fmt_p(s2["shapiro_p"])),
+                ("Mean", s1["mean"], s2["mean"]),
+                ("SD", s1["sd"], s2["sd"]),
+                ("N", s1["n"], s2["n"]),
+                ("Variance", s1["var"], s2["var"]),
+                ("Minimum", s1["min"], s2["min"]),
+                ("1st Quartile", s1["q1"], s2["q1"]),
+                ("Median", s1["median"], s2["median"]),
+                ("3rd Quartile", s1["q3"], s2["q3"]),
+                ("Maximum", s1["max"], s2["max"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s1["tol_lower"], s2["tol_lower"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s1["tol_upper"], s2["tol_upper"]),
+                (f"{mean_ci_conf}% LCI for Mean", s1["ci_lower"], s2["ci_lower"]),
+                (f"{mean_ci_conf}% UCI for Mean", s1["ci_upper"], s2["ci_upper"]),
+            ]
+            axr.text(0.56, 0.96, s1["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            axr.text(0.88, 0.96, s2["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            y = 0.90
+            for name, v1, v2 in rows:
+                axr.text(0.03, y, name, ha="left", va="center", fontsize=9, fontweight="bold")
+                show1 = v1 if isinstance(v1, str) else f"{v1:.{decimals}f}"
+                show2 = v2 if isinstance(v2, str) else f"{v2:.{decimals}f}"
+                axr.text(0.56, y, show1, ha="center", va="center", fontsize=9)
+                axr.text(0.88, y, show2, ha="center", va="center", fontsize=9)
+                y -= 0.055
+
+        plt.tight_layout()
+        return fig
 
     if data_input:
         df = parse_pasted_table(data_input, header=True)
-        if df is not None and not df.empty:
+        if df is None or df.empty:
+            st.error("Could not parse the pasted data.")
+        else:
             st.success(f"Loaded {df.shape[0]} rows × {df.shape[1]} columns")
             with st.expander("Preview data"):
                 st.dataframe(df, use_container_width=True)
+
             numeric_cols = get_numeric_columns(df)
-            all_cols = list(df.columns)
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                selected_vars = st.multiselect("Variables", numeric_cols, default=numeric_cols)
-            with c2:
-                group1 = st.selectbox("Group by 1", ["(None)"] + all_cols)
-            with c3:
-                group2 = st.selectbox("Group by 2", ["(None)"] + all_cols)
-
-            if st.button("Run descriptive statistics", type="primary"):
-                tmp = df.copy()
-                for v in selected_vars:
-                    tmp[v] = to_numeric(tmp[v])
-                groups = [g for g in [group1, group2] if g != "(None)"]
-
-                def calc_stats(x):
-                    return pd.Series({
-                        "N": x.count(),
-                        "Mean": x.mean(),
-                        "Std. Deviation": x.std(ddof=1),
-                        "Minimum": x.min(),
-                        "Median": x.median(),
-                        "Maximum": x.max(),
-                        "CV (%)": (x.std(ddof=1) / x.mean() * 100) if x.mean() != 0 else np.nan,
-                    })
-
-                if groups:
-                    out = tmp.groupby(groups)[selected_vars].apply(lambda g: g.apply(calc_stats)).unstack(level=-1)
-                    if len(selected_vars) == 1:
-                        out.columns = out.columns.droplevel(0)
-                    out = out.reset_index()
+            if len(numeric_cols) == 0:
+                st.error("No numeric columns were detected.")
+            else:
+                is_single = len(numeric_cols) == 1
+                if is_single:
+                    ref_col = numeric_cols[0]
+                    test_col = None
+                    st.info(f"Single numeric column detected: {ref_col}")
                 else:
-                    out = tmp[selected_vars].apply(calc_stats).T.reset_index().rename(columns={"index": "Variable"})
-                report_table(out, "Descriptive statistics", decimals)
-                export_results(
-                    prefix="descriptive_statistics",
-                    report_title="Statistical Analysis Report",
-                    module_name="Descriptive Statistics",
-                    statistical_analysis="This module summarizes one or more quantitative variables using count, mean, standard deviation, minimum, median, maximum, and coefficient of variation. When grouping columns are selected, the summaries are produced within each group defined by the pasted headers.",
-                    offer_text="It offers a fast way to characterize distributions, compare central tendency and variability across groups, and prepare clean summary tables for technical reports or development updates.",
-                    python_tools="Python modules used in this analysis include pandas and numpy for data cleaning and calculations, Streamlit for the interface, matplotlib for optional plotting in other modules, openpyxl for Excel export, and reportlab for PDF-style report generation.",
-                    table_map={"Descriptive Statistics": out},
-                    decimals=decimals,
-                )
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        ref_col = st.selectbox("Reference column", numeric_cols, index=0)
+                    with c2:
+                        test_candidates = [c for c in numeric_cols if c != ref_col]
+                        test_col = st.selectbox("Test column", test_candidates, index=0)
+
+                if st.button("Run descriptive statistics", type="primary"):
+                    ref = to_numeric(df[ref_col]).dropna().to_numpy()
+                    if len(ref) < 3:
+                        st.error("Reference column must contain at least 3 numeric values.")
+                    else:
+                        ref_stats = _one_sample_summary(ref, ref_col, ci_conf=mean_ci_conf / 100, tol_p=tol_cov / 100, tol_confidence=tol_conf / 100)
+                        ref_stats["raw"] = ref
+
+                        tables = {}
+                        figs = {}
+
+                        summary_tbl = pd.DataFrame({
+                            "Groups": [ref_col],
+                            "Count": [ref_stats["n"]],
+                            "Sum": [ref_stats["sum"]],
+                            "Average": [ref_stats["mean"]],
+                            "StDev": [ref_stats["sd"]],
+                            f"{mean_ci_conf}% CI ±": [ref_stats["ci_half"]],
+                        })
+
+                        normality_tbl = pd.DataFrame([
+                            {"Test": "Anderson-Darling", "Group": ref_col, "Statistic": ref_stats["ad_stat"], "P-Value": ref_stats["ad_p"], "Comment": f"{'Normally distributed' if pd.notna(ref_stats['ad_p']) and ref_stats['ad_p'] >= alpha else 'Possible non-normality'} (p {'>=' if pd.notna(ref_stats['ad_p']) and ref_stats['ad_p'] >= alpha else '<'} {alpha:.3f})" if pd.notna(ref_stats['ad_p']) else "AD test not available"},
+                            {"Test": "Shapiro-Wilk", "Group": ref_col, "Statistic": ref_stats["shapiro_stat"], "P-Value": ref_stats["shapiro_p"], "Comment": f"{'Normally distributed' if pd.notna(ref_stats['shapiro_p']) and ref_stats['shapiro_p'] >= alpha else 'Possible non-normality'} (p {'>=' if pd.notna(ref_stats['shapiro_p']) and ref_stats['shapiro_p'] >= alpha else '<'} {alpha:.3f})" if pd.notna(ref_stats['shapiro_p']) else "Shapiro test not available"},
+                        ])
+
+                        st.markdown("### Tables")
+                        report_table(summary_tbl, "Summary of Means", decimals)
+                        report_table(normality_tbl, "Normality Tests", decimals)
+                        tables["Summary of Means"] = summary_tbl
+                        tables["Normality Tests"] = normality_tbl
+
+                        fig = _graphical_summary_figure([ref_stats], f"Graphical Summary: {ref_col}")
+                        st.markdown("### Graphical Summary")
+                        st.pyplot(fig)
+                        figs["Graphical Summary"] = fig_to_png_bytes(fig)
+                        plt.close(fig)
+
+                        export_results(
+                            prefix="descriptive_statistics_single",
+                            report_title="Statistical Analysis Report",
+                            module_name="Descriptive Statistics",
+                            statistical_analysis="This one-sample descriptive analysis summarizes a single quantitative variable using count, sum, mean, standard deviation, quartiles, minimum and maximum. It also checks normality using Anderson-Darling and Shapiro-Wilk tests, computes a confidence interval for the mean, and calculates a normal-theory tolerance interval.",
+                            offer_text="It offers a compact graphical and tabular summary for a single population, helping you assess central tendency, spread, distribution shape, normality, confidence bounds for the mean, and an interval that is expected to cover a chosen proportion of the population.",
+                            python_tools="Python tools used in this analysis include pandas and numpy for data handling and descriptive calculations, scipy.stats and statsmodels for normality tests and interval calculations, matplotlib for the graphical summary, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                            table_map=tables,
+                            figure_map=figs,
+                            conclusion=f"The variable {ref_col} was summarized with descriptive statistics and normality checks. Review the graphical summary, the mean confidence interval, and the tolerance interval to judge both the center and the expected spread of the population.",
+                            decimals=decimals,
+                        )
+
+                        if not is_single and test_col is not None:
+                            test = to_numeric(df[test_col]).dropna().to_numpy()
+                            if len(test) < 3:
+                                st.error("Test column must contain at least 3 numeric values.")
+                            else:
+                                test_stats = _one_sample_summary(test, test_col, ci_conf=mean_ci_conf / 100, tol_p=tol_cov / 100, tol_confidence=tol_conf / 100)
+                                test_stats["raw"] = test
+
+                                summary_tbl = pd.DataFrame({
+                                    "Groups": [ref_col, test_col],
+                                    "Count": [ref_stats["n"], test_stats["n"]],
+                                    "Sum": [ref_stats["sum"], test_stats["sum"]],
+                                    "Average": [ref_stats["mean"], test_stats["mean"]],
+                                    "StDev": [ref_stats["sd"], test_stats["sd"]],
+                                    f"{mean_ci_conf}% CI ±": [ref_stats["ci_half"], test_stats["ci_half"]],
+                                })
+
+                                normality_tbl = pd.DataFrame([
+                                    {"Test": "Anderson-Darling", "Group": ref_col, "Statistic": ref_stats["ad_stat"], "P-Value": ref_stats["ad_p"], "Comment": "Normally distributed" if pd.notna(ref_stats["ad_p"]) and ref_stats["ad_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Anderson-Darling", "Group": test_col, "Statistic": test_stats["ad_stat"], "P-Value": test_stats["ad_p"], "Comment": "Normally distributed" if pd.notna(test_stats["ad_p"]) and test_stats["ad_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Shapiro-Wilk", "Group": ref_col, "Statistic": ref_stats["shapiro_stat"], "P-Value": ref_stats["shapiro_p"], "Comment": "Normally distributed" if pd.notna(ref_stats["shapiro_p"]) and ref_stats["shapiro_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Shapiro-Wilk", "Group": test_col, "Statistic": test_stats["shapiro_stat"], "P-Value": test_stats["shapiro_p"], "Comment": "Normally distributed" if pd.notna(test_stats["shapiro_p"]) and test_stats["shapiro_p"] >= alpha else "Possible non-normality"},
+                                ])
+
+                                f_stat, f_p = _f_test_equal_var(ref, test)
+                                lev_stat, lev_p = stats.levene(ref, test, center="mean")
+                                eqvar_tbl = pd.DataFrame([
+                                    {"Test": "F Test", "Statistic": f_stat, "P-Value": f_p, "Comment": "Equal variances" if pd.notna(f_p) and f_p >= alpha else "Unequal variances"},
+                                    {"Test": "Levene's Test (mean)", "Statistic": lev_stat, "P-Value": lev_p, "Comment": "Equal variances" if lev_p >= alpha else "Unequal variances"},
+                                ])
+
+                                t_eq = stats.ttest_ind(ref, test, equal_var=True)
+                                t_welch = stats.ttest_ind(ref, test, equal_var=False)
+                                mw = stats.mannwhitneyu(ref, test, alternative="two-sided")
+                                comp_tbl = pd.DataFrame([
+                                    {"Test": "Student t-test", "Statistic": t_eq.statistic, "P-Value": t_eq.pvalue, "Comment": "Difference in means" if t_eq.pvalue < alpha else "No evidence of difference in means"},
+                                    {"Test": "Welch t-test", "Statistic": t_welch.statistic, "P-Value": t_welch.pvalue, "Comment": "Difference in means" if t_welch.pvalue < alpha else "No evidence of difference in means"},
+                                    {"Test": "Mann-Whitney U", "Statistic": mw.statistic, "P-Value": mw.pvalue, "Comment": "Difference in distributions" if mw.pvalue < alpha else "No evidence of distributional difference"},
+                                ])
+
+                                anova_tbl, mse, ss_between, ss_total = _anova_two_groups(ref, test)
+                                rsq = ss_between / ss_total if ss_total > 0 else np.nan
+                                rsq_adj = 1 - (1 - rsq) * ((len(ref) + len(test) - 1) / (len(ref) + len(test) - 2 - 0)) if (len(ref) + len(test) - 2) > 0 and pd.notna(rsq) else np.nan
+                                model_tbl = pd.DataFrame({"Pooled SD": [np.sqrt(mse)], "R²": [rsq], "R² (adj)": [rsq_adj]})
+
+                                shaded = _acceptance_band(ref, test, alpha_level=alpha)
+                                graph_tbl = pd.DataFrame({
+                                    "Reference": [ref_col],
+                                    "Reference Mean": [ref_stats["mean"]],
+                                    "Acceptance Lower": [shaded[0]],
+                                    "Acceptance Upper": [shaded[1]],
+                                    "Test Mean": [test_stats["mean"]],
+                                })
+
+                                st.markdown("### Comparison Tables")
+                                report_table(summary_tbl, "Summary of Means", decimals)
+                                report_table(normality_tbl, "Normality Tests", decimals)
+                                report_table(eqvar_tbl, "Equal Variances Test", decimals)
+                                report_table(anova_tbl, "ANOVA", decimals)
+                                report_table(model_tbl, "Model Summary (ANOVA)", decimals)
+                                report_table(comp_tbl, "Mean / Distribution Comparison", decimals)
+
+                                tables = {
+                                    "Summary of Means": summary_tbl,
+                                    "Normality Tests": normality_tbl,
+                                    "Equal Variances Test": eqvar_tbl,
+                                    "ANOVA": anova_tbl,
+                                    "Model Summary (ANOVA)": model_tbl,
+                                    "Mean / Distribution Comparison": comp_tbl,
+                                    "Acceptance Range": graph_tbl,
+                                }
+
+                                shade_label = f"p > {alpha:.3f} zone around {ref_col} mean"
+                                fig = _graphical_summary_figure([ref_stats, test_stats], f"Graphical Summary: {ref_col} vs {test_col}", shaded_range=shaded, shaded_label=shade_label)
+                                st.markdown("### Graphical Summary")
+                                info_box(f"The shaded area is centered on the reference mean and spans the range in which the test mean would remain within the two-sided t-test acceptance zone at α = {alpha:.3f}, using the pooled within-group variance.")
+                                st.pyplot(fig)
+                                figs = {"Graphical Summary": fig_to_png_bytes(fig)}
+                                plt.close(fig)
+
+                                equal_var_msg = "equal variances" if lev_p >= alpha else "unequal variances"
+                                conclusion = (
+                                    f"{ref_col} was treated as the reference and {test_col} as the test population. "
+                                    f"The shaded region in the graph shows the approximate range around the reference mean that would keep the test mean non-significant at α = {alpha:.3f} under the pooled-variance t-test framework. "
+                                    f"The variance assessment suggested {equal_var_msg}. Review the Student/Welch and Mann-Whitney results together with the graphical summary before concluding whether the two populations differ in mean or broader distribution."
+                                )
+
+                                export_results(
+                                    prefix="descriptive_statistics_comparison",
+                                    report_title="Statistical Analysis Report",
+                                    module_name="Descriptive Statistics / Two-Group Comparison",
+                                    statistical_analysis="This analysis summarizes each selected population using descriptive statistics, normality tests, confidence intervals for the mean, and normal-theory tolerance intervals. When both a reference and a test column are selected, it also evaluates equality of variances and compares the two populations using Student's t-test, Welch's t-test, Mann-Whitney U, and a two-group ANOVA summary. The shaded band in the graphical summary is centered on the reference mean and represents the approximate region in which the test mean would remain non-significant at the chosen alpha level using the pooled within-group error term.",
+                                    offer_text="It offers a report-ready way to summarize one population or compare two populations for difference in means, variability, and overall distribution. It also shows whether the test mean stays within the practical acceptance region around the reference mean, which is useful when you want a quick visual link between mean separation and the p-value threshold.",
+                                    python_tools="Python tools used in this analysis include pandas and numpy for cleaning and calculations, scipy.stats for t-tests, Levene, Shapiro-Wilk, F distributions, and tolerance-related statistics, statsmodels for Anderson-Darling normality testing, matplotlib for the graphical summary, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                                    table_map=tables,
+                                    figure_map=figs,
+                                    conclusion=conclusion,
+                                    decimals=decimals,
+                                )
+
 
 
 # -------------------------------------------------
