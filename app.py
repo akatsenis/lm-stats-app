@@ -1,74 +1,455 @@
+import re
+from io import StringIO, BytesIO
+from textwrap import dedent
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
-from io import StringIO
+from matplotlib.patches import Ellipse
 from scipy import stats
 from scipy.stats import t, norm, gaussian_kde, chi2, nct
-from matplotlib.patches import Ellipse
 
-from statsmodels.stats.diagnostic import normal_ad
-from statsmodels.stats.oneway import anova_oneway
+import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.anova import anova_lm
-
+from statsmodels.stats.diagnostic import normal_ad
 from sklearn.decomposition import PCA
 
+from openpyxl import Workbook
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+    PageBreak,
+)
 
-def sl_to_numeric(series):
-    return pd.to_numeric(
-        series.astype(str).str.strip().str.replace("%", "", regex=False),
-        errors="coerce"
+# -------------------------------------------------
+# Page configuration and style
+# -------------------------------------------------
+st.set_page_config(page_title="lm Stats Suite", page_icon="🔬", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 0.9rem; padding-bottom: 2rem;}
+    .app-header {
+        border:1px solid #e2e8f0; border-radius:14px; padding:16px 20px;
+        background: linear-gradient(90deg, #f8fafc 0%, #ffffff 100%);
+        margin-bottom: 1rem; box-shadow: 0 1px 4px rgba(15,23,42,0.05);
+    }
+    .app-title {font-size: 1.75rem; font-weight: 700; margin-bottom: 0.2rem; color:#0f172a;}
+    .app-sub {font-size: 0.96rem; color:#475569;}
+    .report-table table {width:100%; border-collapse:collapse; background:white; font-size:0.95rem;}
+    .report-table caption {text-align:left; font-weight:700; font-size:1rem; color:#111827; margin-bottom:0.55rem;}
+    .report-table thead th {
+        border-top:2px solid #111827; border-bottom:1px solid #111827;
+        padding:8px 12px; text-align:center; background:#f8fafc; color:#111827;
+    }
+    .report-table tbody td {padding:8px 12px; text-align:center; border:none;}
+    .report-table tbody tr:last-child td {border-bottom:2px solid #111827;}
+    .report-caption {font-size:0.85rem; color:#475569; margin-top:-0.5rem; margin-bottom:0.75rem;}
+    div[data-testid='stMetric'] {
+        border:1px solid #e2e8f0; border-radius:12px; padding:10px 12px; background:#fff;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -------------------------------------------------
+# Global visual controls
+# -------------------------------------------------
+st.sidebar.title("🔬 lm Stats")
+st.sidebar.markdown("Select a tool below:")
+app_selection = st.sidebar.radio(
+    "Navigation",
+    [
+        "01 - Descriptive Statistics",
+        "02 - Regression Intervals",
+        "03 - Shelf Life Estimator",
+        "04 - Dissolution Comparison (f2)",
+        "05 - Two-Sample Tests",
+        "06 - Two-Way ANOVA",
+        "07 - Tolerance & Confidence Intervals",
+        "08 - PCA Analysis",
+        "09 - DoE / Response Surfaces",
+    ],
+)
+
+with st.sidebar.expander("Display & export settings", expanded=False):
+    FIG_W = st.slider("Figure width", 6.0, 14.0, 8.5, 0.5)
+    FIG_H = st.slider("Figure height", 4.0, 10.0, 5.5, 0.5)
+    SHOW_LEGEND = st.checkbox("Show legend", value=True)
+    LEGEND_LOC = st.selectbox("Legend location", ["best", "upper right", "upper left", "lower right", "lower left", "center left", "center right", "lower center", "upper center"], index=0)
+    PRIMARY_COLOR = st.color_picker("Primary color", "#1f77b4")
+    SECONDARY_COLOR = st.color_picker("Secondary color", "#ff7f0e")
+    BAND_COLOR = st.color_picker("Band / area color", "#93c5fd")
+    GRID_ALPHA = st.slider("Grid transparency", 0.0, 1.0, 0.25, 0.05)
+    DEFAULT_DECIMALS = st.slider("Default decimals", 1, 8, 3)
+
+st.sidebar.divider()
+st.sidebar.info("Paste data from Excel. Tables, charts, Excel exports, and PDF-style reports are built into the app.")
+
+
+# -------------------------------------------------
+# UI helpers
+# -------------------------------------------------
+def app_header(title, subtitle=""):
+    st.markdown(
+        f"""
+        <div class='app-header'>
+            <div class='app-title'>{title}</div>
+            <div class='app-sub'>{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-def sl_parse_xy_data(text):
+
+def info_box(text):
+    st.markdown(f"<div class='report-caption'>{text}</div>", unsafe_allow_html=True)
+
+
+# -------------------------------------------------
+# Data helpers
+# -------------------------------------------------
+def to_numeric(series):
+    return pd.to_numeric(series.astype(str).str.strip().str.replace("%", "", regex=False), errors="coerce")
+
+
+def parse_pasted_table(text, header=True):
     text = str(text).strip()
     if not text:
-        raise ValueError("Paste two Excel columns: Time and Response.")
-
+        return None
     parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=r"\s+", header=None, engine="python"),
+        lambda s: pd.read_csv(StringIO(s), sep="\t", engine="python", header=0 if header else None),
+        lambda s: pd.read_csv(StringIO(s), sep=",", engine="python", header=0 if header else None),
+        lambda s: pd.read_csv(StringIO(s), sep=";", engine="python", header=0 if header else None),
+        lambda s: pd.read_csv(StringIO(s), sep=r"\s+", engine="python", header=0 if header else None),
     ]
-
-    df = None
     for parser in parsers:
         try:
-            trial = parser(text)
-            if trial.shape[1] >= 2:
-                df = trial.iloc[:, :2].copy()
-                break
-        except:
-            pass
+            df = parser(text)
+            if df is not None and df.shape[1] >= 1:
+                if header:
+                    df.columns = [str(c).strip() for c in df.columns]
+                return df.dropna(how="all").reset_index(drop=True)
+        except Exception:
+            continue
+    return None
 
-    if df is None or df.shape[1] < 2:
-        raise ValueError("Could not read two columns. Paste Time and Response from Excel.")
 
-    df.columns = ["x", "y"]
+def parse_xy(text):
+    """Return dataframe with x,y and axis labels; accepts with or without headers."""
+    raw = parse_pasted_table(text, header=False)
+    if raw is None or raw.shape[1] < 2:
+        raise ValueError("Paste at least two columns from Excel.")
+    raw = raw.iloc[:, :2].copy()
+    x_label, y_label = "X", "Y"
+    first_row = raw.iloc[0].astype(str)
+    first_row_numeric = pd.to_numeric(first_row.str.replace("%", "", regex=False), errors="coerce")
+    if first_row_numeric.isna().any():
+        x_label = str(raw.iloc[0, 0]).strip() or "X"
+        y_label = str(raw.iloc[0, 1]).strip() or "Y"
+        raw = raw.iloc[1:].reset_index(drop=True)
+    raw.columns = ["x", "y"]
+    raw["x"] = to_numeric(raw["x"])
+    raw["y"] = to_numeric(raw["y"])
+    raw = raw.dropna().sort_values("x").reset_index(drop=True)
+    if len(raw) < 3 or raw["x"].nunique() < 2:
+        raise ValueError("At least 3 valid rows and 2 unique X values are required.")
+    return raw, x_label, y_label
 
-    first_row_num = sl_to_numeric(df.iloc[0])
-    if first_row_num.isna().any():
-        df = df.iloc[1:].reset_index(drop=True)
 
-    df["x"] = sl_to_numeric(df["x"])
-    df["y"] = sl_to_numeric(df["y"])
-    df = df.dropna().sort_values("x").reset_index(drop=True)
+def parse_x_values(text):
+    text = str(text).strip()
+    if not text:
+        return np.array([])
+    vals = []
+    for part in re.split(r"[\s,;\t]+", text):
+        if part:
+            vals.append(float(part))
+    return np.array(vals, dtype=float)
 
-    if len(df) < 3:
-        raise ValueError("At least 3 valid rows are required.")
-    if df["x"].nunique() < 2:
-        raise ValueError("Time values must not all be the same.")
 
-    return df
+def parse_optional_float(txt):
+    txt = str(txt).strip()
+    if txt == "":
+        return None
+    return float(txt)
 
-def sl_parse_x_values(text):
+
+def parse_one_col(text):
+    df = parse_pasted_table(text, header=False)
+    if df is None:
+        return np.array([])
+    return to_numeric(df.iloc[:, 0]).dropna().to_numpy()
+
+
+def get_numeric_columns(df, min_nonempty=2, required_numeric_ratio=0.95):
+    out = []
+    for col in df.columns:
+        raw = df[col]
+        raw_str = raw.astype(str).str.strip()
+        nonempty_mask = raw.notna() & raw_str.ne("") & raw_str.str.lower().ne("nan")
+        if nonempty_mask.sum() < min_nonempty:
+            continue
+        converted = pd.to_numeric(raw_str.str.replace("%", "", regex=False), errors="coerce")
+        numeric_ratio_among_nonempty = converted[nonempty_mask].notna().mean()
+        if numeric_ratio_among_nonempty >= required_numeric_ratio:
+            out.append(col)
+    return out
+
+
+def fmt_p(p):
+    if pd.isna(p):
+        return "-"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
+
+
+# -------------------------------------------------
+# Table display and download helpers
+# -------------------------------------------------
+def report_table(df, caption="", decimals=None):
+    decimals = DEFAULT_DECIMALS if decimals is None else decimals
+    styled = (
+        df.style
+        .hide(axis="index")
+        .set_caption(caption)
+        .set_table_styles([
+            {"selector": "caption", "props": [("text-align", "left"), ("font-size", "1rem"), ("font-weight", "700"), ("margin-bottom", "0.55rem")]},
+            {"selector": "thead th", "props": [("border-top", "2px solid #111827"), ("border-bottom", "1px solid #111827"), ("padding", "8px 12px"), ("text-align", "center"), ("background-color", "#f8fafc")]},
+            {"selector": "tbody td", "props": [("padding", "8px 12px"), ("text-align", "center")]},
+            {"selector": "tbody tr:last-child td", "props": [("border-bottom", "2px solid #111827")]},
+        ])
+        .format(precision=decimals, na_rep="-")
+    )
+    st.markdown(f"<div class='report-table'>{styled.to_html()}</div>", unsafe_allow_html=True)
+
+
+def make_excel_bytes(sheet_map):
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for sheet_name, df in sheet_map.items():
+            safe = re.sub(r"[^A-Za-z0-9 _-]", "", sheet_name)[:31] or "Sheet1"
+            out = df.copy()
+            out.to_excel(writer, sheet_name=safe, index=False)
+            ws = writer.sheets[safe]
+            for col_cells in ws.columns:
+                max_len = 0
+                col_letter = col_cells[0].column_letter
+                for cell in col_cells:
+                    try:
+                        max_len = max(max_len, len(str(cell.value)))
+                    except Exception:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 28)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def fig_to_png_bytes(fig):
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=220, bbox_inches="tight", facecolor="white")
+    bio.seek(0)
+    return bio.getvalue()
+
+
+# -------------------------------------------------
+# PDF report generation
+# -------------------------------------------------
+def _pdf_table(df, styles, title, decimals=3, max_rows=40):
+    story = []
+    story.append(Paragraph(title, styles["Heading3"]))
+    if len(df) > max_rows:
+        story.append(Paragraph(f"Table truncated to first {max_rows} rows for compact reporting.", styles["BodyText"]))
+        df = df.head(max_rows)
+    fmt_df = df.copy()
+    for c in fmt_df.columns:
+        if pd.api.types.is_numeric_dtype(fmt_df[c]):
+            fmt_df[c] = fmt_df[c].map(lambda x: "-" if pd.isna(x) else f"{x:.{decimals}f}")
+        else:
+            fmt_df[c] = fmt_df[c].fillna("-").astype(str)
+    data = [list(fmt_df.columns)] + fmt_df.values.tolist()
+    ncols = max(1, len(fmt_df.columns))
+    page_w = 27.5 * cm
+    col_width = page_w / ncols
+    tbl = Table(data, repeatRows=1, colWidths=[col_width] * ncols)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F8FAFC")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEADING", (0, 0), (-1, -1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.2, colors.black),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.black),
+        ("LINEBELOW", (0, -1), (-1, -1), 1.2, colors.black),
+    ]))
+    story.extend([tbl, Spacer(1, 0.35 * cm)])
+    return story
+
+
+def make_pdf_report(report_title, module_name, statistical_analysis, offer_text, python_tools, tables, figures, conclusion=None, decimals=3):
+    bio = BytesIO()
+    doc = SimpleDocTemplate(
+        bio,
+        pagesize=landscape(A4),
+        leftMargin=1.2 * cm,
+        rightMargin=1.2 * cm,
+        topMargin=1.2 * cm,
+        bottomMargin=1.1 * cm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="SmallBody", parent=styles["BodyText"], fontSize=9, leading=12, alignment=TA_LEFT))
+    story = []
+
+    story.append(Paragraph(report_title, styles["Title"]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(f"Module: <b>{module_name}</b>", styles["Heading2"]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph("Statistical Analysis", styles["Heading2"]))
+    story.append(Paragraph(statistical_analysis, styles["SmallBody"]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph("What this analysis offers", styles["Heading2"]))
+    story.append(Paragraph(offer_text, styles["SmallBody"]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph("Python tools used", styles["Heading2"]))
+    story.append(Paragraph(python_tools, styles["SmallBody"]))
+    if conclusion:
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph("Conclusion", styles["Heading2"]))
+        story.append(Paragraph(conclusion, styles["SmallBody"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    if tables:
+        story.append(Paragraph("Tables", styles["Heading2"]))
+        for caption, df in tables:
+            story.extend(_pdf_table(df, styles, caption, decimals=decimals))
+
+    if figures:
+        story.append(PageBreak())
+        story.append(Paragraph("Figures", styles["Heading2"]))
+        for caption, fig_bytes in figures:
+            story.append(Paragraph(caption, styles["Heading3"]))
+            img = Image(BytesIO(fig_bytes))
+            img._restrictSize(24.5 * cm, 13.5 * cm)
+            story.append(img)
+            story.append(Spacer(1, 0.3 * cm))
+
+    doc.build(story)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def export_results(prefix, report_title, module_name, statistical_analysis, offer_text, python_tools, table_map, figure_map=None, conclusion=None, decimals=None):
+    decimals = DEFAULT_DECIMALS if decimals is None else decimals
+    figure_map = figure_map or {}
+    c1, c2 = st.columns(2)
+    excel_bytes = make_excel_bytes(table_map)
+    pdf_bytes = make_pdf_report(
+        report_title=report_title,
+        module_name=module_name,
+        statistical_analysis=statistical_analysis,
+        offer_text=offer_text,
+        python_tools=python_tools,
+        tables=list(table_map.items()),
+        figures=list(figure_map.items()),
+        conclusion=conclusion,
+        decimals=decimals,
+    )
+    with c1:
+        st.download_button("Download Excel workbook", excel_bytes, file_name=f"{prefix}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with c2:
+        st.download_button("Download PDF-style report", pdf_bytes, file_name=f"{prefix}.pdf", mime="application/pdf")
+
+
+# -------------------------------------------------
+# Plot helpers
+# -------------------------------------------------
+def apply_ax_style(ax, title, xlabel, ylabel, legend=None):
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=GRID_ALPHA)
+    if SHOW_LEGEND and legend:
+        ax.legend(frameon=False, loc=LEGEND_LOC)
+
+
+def residual_plot(fitted, residuals, xlabel="Fitted", ylabel="Residuals", title="Residuals vs fitted"):
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    ax.scatter(fitted, residuals, color=PRIMARY_COLOR, s=42)
+    ax.axhline(0, color="#111827", lw=1.3, ls="--")
+    apply_ax_style(ax, title, xlabel, ylabel)
+    return fig
+
+
+def qq_plot(residuals, title="Normal probability plot of residuals"):
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    stats.probplot(residuals, dist="norm", plot=ax)
+    ax.get_lines()[0].set_markerfacecolor(PRIMARY_COLOR)
+    ax.get_lines()[0].set_markeredgecolor(PRIMARY_COLOR)
+    ax.get_lines()[1].set_color(SECONDARY_COLOR)
+    apply_ax_style(ax, title, "Theoretical quantiles", "Ordered residuals")
+    return fig
+
+
+# -------------------------------------------------
+# Statistical helpers
+# -------------------------------------------------
+def fit_linear(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    X = np.column_stack([np.ones(n), x])
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    intercept, slope = beta
+    fitted = X @ beta
+    resid = y - fitted
+    df = n - 2
+    s = np.sqrt(np.sum(resid**2) / df)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    ss_res = np.sum(resid**2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return {"intercept": intercept, "slope": slope, "XtX_inv": XtX_inv, "fitted": fitted, "resid": resid, "df": df, "s": s, "r2": r2}
+
+
+def predict_intervals(model, x_vals, alpha=0.05):
+    x_vals = np.asarray(x_vals, dtype=float)
+    X0 = np.column_stack([np.ones(len(x_vals)), x_vals])
+    fit = model["intercept"] + model["slope"] * x_vals
+    h = np.sum((X0 @ model["XtX_inv"]) * X0, axis=1)
+    tcrit = t.ppf(1 - alpha / 2, model["df"])
+    se_mean = model["s"] * np.sqrt(h)
+    se_pred = model["s"] * np.sqrt(1 + h)
+    return pd.DataFrame({
+        "X": x_vals,
+        "Fitted": fit,
+        "Lower CI": fit - tcrit * se_mean,
+        "Upper CI": fit + tcrit * se_mean,
+        "Lower PI": fit - tcrit * se_pred,
+        "Upper PI": fit + tcrit * se_pred,
+    })
+
+
+def reg_parse_prediction_points(text):
     text = str(text).strip()
     if not text:
         return np.array([], dtype=float)
-
     parts = re.split(r"[\s,\t;]+", text)
     vals = []
     for p in parts:
@@ -77,2848 +458,1711 @@ def sl_parse_x_values(text):
             vals.append(float(p))
     return np.array(vals, dtype=float)
 
-def sl_fit_linear(x, y):
+
+def reg_fit_linear_model(x, y):
     x = np.asarray(x, dtype=float).ravel()
     y = np.asarray(y, dtype=float).ravel()
-
     n = len(x)
     X = np.column_stack([np.ones(n), x])
     XtX_inv = np.linalg.inv(X.T @ X)
     beta = XtX_inv @ (X.T @ y)
-
     intercept, slope = beta
-    fitted = X @ beta
-    resid = y - fitted
+    y_fit = X @ beta
+    resid = y - y_fit
     df = n - 2
     s = np.sqrt(np.sum(resid**2) / df)
-
     ss_tot = np.sum((y - np.mean(y))**2)
     ss_res = np.sum(resid**2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-
     return {
         "intercept": intercept,
         "slope": slope,
         "XtX_inv": XtX_inv,
-        "fitted": fitted,
-        "resid": resid,
         "s": s,
         "df": df,
-        "r2": r2
+        "r2": r2,
+        "x": x,
+        "y": y,
+        "y_fit": y_fit,
+        "fitted": y_fit,
+        "resid": resid,
     }
 
-def sl_predict(model, x_values, confidence=0.95, one_sided=True):
+
+def reg_predict_with_intervals(model, x_values, confidence=0.95, side="upper"):
     x_values = np.asarray(x_values, dtype=float).ravel()
     Xg = np.column_stack([np.ones(len(x_values)), x_values])
-
     beta = np.array([model["intercept"], model["slope"]])
-    fit = Xg @ beta
-
+    yhat = Xg @ beta
     h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
     se_mean = model["s"] * np.sqrt(h)
     se_pred = model["s"] * np.sqrt(1 + h)
-
     alpha = 1 - confidence
-    tcrit = t.ppf(confidence, model["df"]) if one_sided else t.ppf(1 - alpha / 2, model["df"])
-
-    ci_lower = fit - tcrit * se_mean
-    ci_upper = fit + tcrit * se_mean
-    pi_lower = fit - tcrit * se_pred
-    pi_upper = fit + tcrit * se_pred
-
+    if side == "two-sided":
+        tcrit = t.ppf(1 - alpha / 2, model["df"])
+    else:
+        tcrit = t.ppf(confidence, model["df"])
+    ci_lower = yhat - tcrit * se_mean
+    ci_upper = yhat + tcrit * se_mean
+    pi_lower = yhat - tcrit * se_pred
+    pi_upper = yhat + tcrit * se_pred
     return pd.DataFrame({
         "x": x_values,
-        "fit": fit,
+        "fit": yhat,
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
         "pi_lower": pi_lower,
-        "pi_upper": pi_upper
+        "pi_upper": pi_upper,
     })
 
-def sl_find_crossing(xv, yv, limit):
-    xv = np.asarray(xv, dtype=float)
-    yv = np.asarray(yv, dtype=float)
+
+def reg_find_crossing(xv, yv, limit):
     d = yv - limit
+    idx = np.where(d[:-1] * d[1:] <= 0)[0]
+    if len(idx) == 0:
+        return None
+    i = idx[0]
+    x1, x2 = xv[i], xv[i + 1]
+    y1, y2 = yv[i], yv[i + 1]
+    if y2 == y1:
+        return x1
+    return x1 + (limit - y1) * (x2 - x1) / (y2 - y1)
 
-    if d[0] == 0:
-        return xv[0]
 
-    for i in range(len(d) - 1):
-        if d[i] == 0:
-            return xv[i]
-        if d[i] * d[i + 1] < 0:
-            x1, x2 = xv[i], xv[i + 1]
-            y1, y2 = yv[i], yv[i + 1]
-            if y2 == y1:
-                return x1
-            return x1 + (limit - y1) * (x2 - x1) / (y2 - y1)
-
-    return None
-
-def sl_get_bound_column(spec_side, shelf_basis):
-    if shelf_basis == "fit":
-        return "fit"
-    if shelf_basis == "ci":
-        return "ci_lower" if spec_side == "lower" else "ci_upper"
-    if shelf_basis == "pi":
-        return "pi_lower" if spec_side == "lower" else "pi_upper"
-    raise ValueError("Invalid shelf-life basis.")
-
-def sl_plot(
+def plot_regression_advanced(
     data_df,
+    model,
     grid_df,
-    spec_side,
-    spec_limit,
-    shelf_basis,
-    show_ci_band,
-    show_pi_band,
-    title,
-    xlabel,
-    ylabel,
-    point_label,
-    y_suffix,
-    spec_label
+    confidence=0.95,
+    interval="pi",
+    side="upper",
+    title="",
+    xlabel="Time",
+    ylabel="Response",
+    point_label="Data",
+    y_suffix="%",
+    spec_enabled=False,
+    spec_limit=None,
+    spec_label="US",
+    crossing_on="auto",
 ):
     x = data_df["x"].to_numpy()
     y = data_df["y"].to_numpy()
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    ax.scatter(x, y, color=PRIMARY_COLOR, s=50, alpha=0.85, label=point_label, zorder=3)
+    ax.plot(grid_df["x"], grid_df["fit"], color="#2c3e50", lw=2, label="Fitted Line")
 
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    if interval in ["ci", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Confidence Interval (CI)")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.2)
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.2)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Upper CI")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=BAND_COLOR, alpha=0.20, label="Lower CI")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
 
-    if show_pi_band:
-        ax.fill_between(
-            grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"],
-            color="red", alpha=0.08, label="PI band"
-        )
-        ax.plot(grid_df["x"], grid_df["pi_lower"], color="red", lw=1.0, ls=(0, (4, 4)))
-        ax.plot(grid_df["x"], grid_df["pi_upper"], color="red", lw=1.0, ls=(0, (4, 4)))
+    if interval in ["pi", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Prediction Interval (PI)")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Upper PI")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=SECONDARY_COLOR, alpha=0.13, label="Lower PI")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
 
-    if show_ci_band:
-        ax.fill_between(
-            grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"],
-            color="royalblue", alpha=0.12, label="CI band"
-        )
-        ax.plot(grid_df["x"], grid_df["ci_lower"], color="royalblue", lw=1.0, ls="--")
-        ax.plot(grid_df["x"], grid_df["ci_upper"], color="royalblue", lw=1.0, ls="--")
-
-    ax.scatter(x, y, color="black", s=40, label=point_label, zorder=3)
-    ax.plot(grid_df["x"], grid_df["fit"], color="black", lw=1.6, label="Fitted line")
-
-    bound_col = sl_get_bound_column(spec_side, shelf_basis)
-    bound_color = {"fit": "black", "ci": "royalblue", "pi": "red"}[shelf_basis]
-    bound_label = {
-        "fit": "Shelf-life line (fit)",
-        "ci": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} CI)",
-        "pi": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} PI)"
-    }[shelf_basis]
-
-    if shelf_basis != "fit":
-        ax.plot(grid_df["x"], grid_df[bound_col], color=bound_color, lw=2.2, label=bound_label)
-
-    ax.axhline(spec_limit, color="black", ls="--", lw=1.2, label=spec_label)
-
-    shelf_life = sl_find_crossing(grid_df["x"].to_numpy(), grid_df[bound_col].to_numpy(), spec_limit)
-
-    if shelf_life is not None:
-        ax.axvline(shelf_life, color="black", ls="--", lw=1.2)
-
-    ymax_data = max(
-        np.max(y),
-        np.max(grid_df["fit"]),
-        np.max(grid_df["ci_upper"]),
-        np.max(grid_df["pi_upper"])
-    )
-    ymin_data = min(
-        np.min(y),
-        np.min(grid_df["fit"]),
-        np.min(grid_df["ci_lower"]),
-        np.min(grid_df["pi_lower"])
-    )
-    pad = 0.03 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
-
-    ax.text(
-        grid_df["x"].max() * 0.98,
-        spec_limit + pad,
-        f"{spec_label} = {spec_limit:.3f}{y_suffix}",
-        ha="right",
-        va="bottom",
-        fontsize=11
-    )
-
-    if shelf_life is not None:
+    crossing_x = None
+    if spec_enabled and spec_limit is not None:
+        ax.axhline(spec_limit, color="#27ae60", ls="--", lw=1.5, label=f"Limit ({spec_label})")
+        curve_map = {
+            "fit": grid_df["fit"].to_numpy(),
+            "ci_upper": grid_df["ci_upper"].to_numpy(),
+            "ci_lower": grid_df["ci_lower"].to_numpy(),
+            "pi_upper": grid_df["pi_upper"].to_numpy(),
+            "pi_lower": grid_df["pi_lower"].to_numpy(),
+        }
+        if crossing_on == "auto":
+            if interval in ["both", "pi"]:
+                crossing_on = "pi_upper" if side == "upper" else "pi_lower" if side == "lower" else "pi_upper"
+            else:
+                crossing_on = "ci_upper" if side == "upper" else "ci_lower" if side == "lower" else "ci_upper"
+        if crossing_on in curve_map:
+            crossing_x = reg_find_crossing(grid_df["x"].to_numpy(), curve_map[crossing_on], spec_limit)
+            if crossing_x is not None:
+                ax.axvline(crossing_x, color="#27ae60", ls=":", lw=1.5)
+                ymin, ymax = ax.get_ylim()
+                ax.text(
+                    crossing_x,
+                    ymin + 0.05 * (ymax - ymin),
+                    f" {crossing_x:.2f}",
+                    color="#27ae60",
+                    ha="left",
+                    va="bottom",
+                    fontsize=11,
+                    weight="bold",
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
+                )
+        xmin = grid_df["x"].min()
+        xmax = grid_df["x"].max()
+        ymax_data = max(grid_df["fit"].max(), grid_df["ci_upper"].max(), grid_df["pi_upper"].max(), y.max())
+        ymin_data = min(grid_df["fit"].min(), grid_df["ci_lower"].min(), grid_df["pi_lower"].min(), y.min())
+        pad = 0.02 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
+        suffix = y_suffix or ""
         ax.text(
-            shelf_life,
-            ymin_data + pad,
-            f"{shelf_life:.2f}",
-            ha="right",
+            xmin + (xmax - xmin) * 0.02,
+            spec_limit + pad,
+            f"{spec_label} = {spec_limit:.1f}{suffix}",
+            ha="left",
             va="bottom",
-            fontsize=11
+            fontsize=11,
+            color="#27ae60",
+            weight="bold",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=3),
         )
 
     if y_suffix:
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
 
     if not str(title).strip():
-        side_txt = "Lower Spec" if spec_side == "lower" else "Upper Spec"
-        basis_txt = {"fit": "Fit", "ci": "Confidence Bound", "pi": "Prediction Bound"}[shelf_basis]
-        title = f"Shelf Life Estimator ({side_txt}, {basis_txt})"
-
-    ax.set_title(title, fontsize=16, weight="bold")
-    ax.set_xlabel(xlabel, fontsize=12, weight="bold")
-    ax.set_ylabel(ylabel, fontsize=12, weight="bold")
-    ax.legend(frameon=False, loc="best")
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-    return shelf_life, bound_col
-
-def dis_make_unique(names):
-    out = []
-    seen = {}
-    for i, n in enumerate(names):
-        n = str(n).strip()
-        if n == "" or n.lower() == "nan":
-            n = f"Col{i+1}"
-        if n in seen:
-            seen[n] += 1
-            n = f"{n}_{seen[n]}"
-        else:
-            seen[n] = 1
-        out.append(n)
-    return out
-
-def dis_to_numeric(series):
-    return pd.to_numeric(
-        series.astype(str).str.strip().str.replace("%", "", regex=False),
-        errors="coerce"
-    )
-
-def dis_parse_profile_table(text):
-    text = str(text).strip()
-    if not text:
-        raise ValueError("Paste a dissolution table.")
-
-    parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", header=None, engine="python"),
-    ]
-
-    df_raw = None
-    for parser in parsers:
-        try:
-            trial = parser(text)
-            if trial.shape[1] >= 2:
-                df_raw = trial.copy()
-                break
-        except:
-            pass
-
-    if df_raw is None or df_raw.shape[1] < 2:
-        raise ValueError("Could not read the pasted table. Use at least 2 columns: Time and one or more units.")
-
-    df_raw = df_raw.dropna(how="all").reset_index(drop=True)
-
-    first_row = df_raw.iloc[0].astype(str).str.strip()
-    first_row_numeric = pd.to_numeric(first_row, errors="coerce").notna().all()
-
-    if first_row_numeric:
-        df = df_raw.copy()
-        df.columns = ["Time"] + [f"Unit{i}" for i in range(1, df.shape[1])]
-    else:
-        df = df_raw.iloc[1:].reset_index(drop=True).copy()
-        header = dis_make_unique(first_row.tolist())
-        df.columns = header
-        df.rename(columns={df.columns[0]: "Time"}, inplace=True)
-
-    df.columns = dis_make_unique(df.columns)
-
-    df["Time"] = dis_to_numeric(df["Time"])
-
-    unit_cols = [c for c in df.columns if c != "Time"]
-    for c in unit_cols:
-        df[c] = dis_to_numeric(df[c])
-
-    df = df.dropna(subset=["Time"]).copy()
-    df = df.loc[df[unit_cols].notna().any(axis=1)].copy()
-    df = df.sort_values("Time").reset_index(drop=True)
-
-    if len(df) == 0:
-        raise ValueError("No valid dissolution rows found after cleaning.")
-
-    return df
-
-def dis_profile_summary(df):
-    unit_cols = [c for c in df.columns if c != "Time"]
-    out = pd.DataFrame({"Time": df["Time"].to_numpy()})
-
-    values = df[unit_cols].to_numpy(dtype=float)
-    out["n_units"] = np.sum(np.isfinite(values), axis=1)
-    out["mean"] = np.nanmean(values, axis=1)
-    out["sd"] = np.nanstd(values, axis=1, ddof=1)
-
-    sd_mask = out["n_units"] <= 1
-    out.loc[sd_mask, "sd"] = np.nan
-
-    out["cv_pct"] = 100 * out["sd"] / out["mean"]
-    out.loc[out["mean"] == 0, "cv_pct"] = np.nan
-
-    return out
-
-def dis_merge_profiles(ref_summary, test_summary):
-    merged = ref_summary.merge(
-        test_summary,
-        on="Time",
-        how="inner",
-        suffixes=("_ref", "_test")
-    )
-    merged = merged.sort_values("Time").reset_index(drop=True)
-
-    if len(merged) == 0:
-        raise ValueError("Reference and Test have no common timepoints.")
-
-    return merged
-
-def dis_select_points(merged, include_zero=True, cutoff_mode="all", threshold=85.0):
-    use = merged.copy()
-
-    if not include_zero:
-        use = use.loc[use["Time"] != 0].copy()
-
-    if len(use) == 0:
-        raise ValueError("No timepoints left after filtering.")
-
-    first_both_ge_idx = None
-    for i in range(len(use)):
-        if use.loc[i, "mean_ref"] >= threshold and use.loc[i, "mean_test"] >= threshold:
-            first_both_ge_idx = i
-            break
-
-    if cutoff_mode == "apply_85" and first_both_ge_idx is not None:
-        use = use.iloc[:first_both_ge_idx + 1].copy()
-
-    if len(use) < 3:
-        raise ValueError("At least 3 selected timepoints are needed to calculate f2.")
-
-    return use.reset_index(drop=True), first_both_ge_idx
-
-def dis_calc_f2(ref_means, test_means):
-    ref_means = np.asarray(ref_means, dtype=float)
-    test_means = np.asarray(test_means, dtype=float)
-
-    n = len(ref_means)
-    if n < 1:
-        return np.nan
-
-    msd = np.mean((ref_means - test_means) ** 2)
-    f2 = 50 * np.log10(100 / np.sqrt(1 + msd))
-    return f2
-
-def dis_get_unit_cols(df):
-    return [c for c in df.columns if c != "Time"]
-
-def dis_get_selected_matrix(df, selected_times):
-    sub = df[df["Time"].isin(selected_times)].copy()
-    sub = sub.sort_values("Time").reset_index(drop=True)
-
-    times_sorted = np.sort(np.asarray(selected_times, dtype=float))
-    if len(sub) != len(times_sorted) or not np.allclose(sub["Time"].to_numpy(dtype=float), times_sorted):
-        raise ValueError("Selected timepoints could not be aligned back to the original profile table.")
-
-    unit_cols = dis_get_unit_cols(df)
-    mat = sub[unit_cols].to_numpy(dtype=float)
-    return mat, unit_cols
-
-def dis_fda_checks(ref_df, test_df, merged, selected, threshold=85.0, include_zero=False):
-    ref_units = len(dis_get_unit_cols(ref_df))
-    test_units = len(dis_get_unit_cols(test_df))
-
-    same_original_times = np.array_equal(
-        np.sort(ref_df["Time"].to_numpy(dtype=float)),
-        np.sort(test_df["Time"].to_numpy(dtype=float))
-    )
-
-    same_selected_time_count = len(selected)
-    at_least_12 = (ref_units >= 12) and (test_units >= 12)
-    at_least_3_points = same_selected_time_count >= 3
-
-    both_ge = (selected["mean_ref"] >= threshold) & (selected["mean_test"] >= threshold)
-    n_post85_kept = int(both_ge.sum())
-    one_post85_ok = n_post85_kept <= 1
-
-    selected_nonzero = selected[selected["Time"] > 0].copy()
-    if include_zero:
-        selected_nonzero = selected.copy()
-
-    early_cv_ref = np.nan
-    early_cv_test = np.nan
-    later_max_cv_ref = np.nan
-    later_max_cv_test = np.nan
-    cv_ok = True
-
-    if len(selected_nonzero) > 0:
-        early_cv_ref = selected_nonzero.iloc[0]["cv_pct_ref"]
-        early_cv_test = selected_nonzero.iloc[0]["cv_pct_test"]
-
-        later_ref = selected_nonzero.iloc[1:]["cv_pct_ref"].dropna()
-        later_test = selected_nonzero.iloc[1:]["cv_pct_test"].dropna()
-
-        later_max_cv_ref = later_ref.max() if len(later_ref) > 0 else np.nan
-        later_max_cv_test = later_test.max() if len(later_test) > 0 else np.nan
-
-        if pd.notna(early_cv_ref) and early_cv_ref > 20:
-            cv_ok = False
-        if pd.notna(early_cv_test) and early_cv_test > 20:
-            cv_ok = False
-        if pd.notna(later_max_cv_ref) and later_max_cv_ref > 10:
-            cv_ok = False
-        if pd.notna(later_max_cv_test) and later_max_cv_test > 10:
-            cv_ok = False
-
-    fda_tbl = pd.DataFrame([
-        {"Criterion": "Same original timepoints in both profiles", "Pass": "Yes" if same_original_times else "No"},
-        {"Criterion": "At least 12 units in Reference and Test", "Pass": "Yes" if at_least_12 else "No"},
-        {"Criterion": "At least 3 selected timepoints for f2", "Pass": "Yes" if at_least_3_points else "No"},
-        {"Criterion": "No more than one selected point after both are ≥ threshold", "Pass": "Yes" if one_post85_ok else "No"},
-        {"Criterion": "CV at earlier selected timepoint ≤ 20% and later ≤ 10%", "Pass": "Yes" if cv_ok else "No"},
-    ])
-
-    detail_tbl = pd.DataFrame([{
-        "Reference_units": ref_units,
-        "Test_units": test_units,
-        "Selected_timepoints": same_selected_time_count,
-        "Selected_points_where_both_ge_threshold": n_post85_kept,
-        "Earlier_CV_ref": early_cv_ref,
-        "Earlier_CV_test": early_cv_test,
-        "Later_max_CV_ref": later_max_cv_ref,
-        "Later_max_CV_test": later_max_cv_test,
-    }])
-
-    conventional_ok = bool((fda_tbl["Pass"] == "Yes").all())
-
-    return fda_tbl, detail_tbl, conventional_ok
-
-def dis_bootstrap_f2(ref_mat, test_mat, n_boot=2000, seed=123):
-    rng = np.random.default_rng(seed)
-
-    n_ref = ref_mat.shape[1]
-    n_test = test_mat.shape[1]
-
-    out = np.empty(n_boot, dtype=float)
-    for b in range(n_boot):
-        idx_ref = rng.integers(0, n_ref, size=n_ref)
-        idx_test = rng.integers(0, n_test, size=n_test)
-
-        ref_mean = np.nanmean(ref_mat[:, idx_ref], axis=1)
-        test_mean = np.nanmean(test_mat[:, idx_test], axis=1)
-
-        out[b] = dis_calc_f2(ref_mean, test_mean)
-
-    return out
-
-def dis_jackknife_f2(ref_mat, test_mat):
-    vals = []
-
-    n_ref = ref_mat.shape[1]
-    n_test = test_mat.shape[1]
-
-    for j in range(n_ref):
-        keep = [i for i in range(n_ref) if i != j]
-        if len(keep) >= 1:
-            ref_mean = np.nanmean(ref_mat[:, keep], axis=1)
-            test_mean = np.nanmean(test_mat, axis=1)
-            vals.append(dis_calc_f2(ref_mean, test_mean))
-
-    for j in range(n_test):
-        keep = [i for i in range(n_test) if i != j]
-        if len(keep) >= 1:
-            ref_mean = np.nanmean(ref_mat, axis=1)
-            test_mean = np.nanmean(test_mat[:, keep], axis=1)
-            vals.append(dis_calc_f2(ref_mean, test_mean))
-
-    return np.asarray(vals, dtype=float)
-
-def dis_bca_interval(theta_hat, boot_vals, jack_vals, conf=0.90):
-    boot_vals = np.asarray(boot_vals, dtype=float)
-    boot_vals = boot_vals[np.isfinite(boot_vals)]
-    jack_vals = np.asarray(jack_vals, dtype=float)
-    jack_vals = jack_vals[np.isfinite(jack_vals)]
-
-    if len(boot_vals) < 10:
-        return np.nan, np.nan, np.nan, np.nan
-
-    alpha = 1 - conf
-
-    prop_less = np.mean(boot_vals < theta_hat)
-    eps = 1 / (2 * len(boot_vals))
-    prop_less = np.clip(prop_less, eps, 1 - eps)
-    z0 = norm.ppf(prop_less)
-
-    if len(jack_vals) < 3:
-        a = 0.0
-    else:
-        jack_mean = np.mean(jack_vals)
-        num = np.sum((jack_mean - jack_vals) ** 3)
-        den = 6 * (np.sum((jack_mean - jack_vals) ** 2) ** 1.5)
-        a = num / den if den > 0 else 0.0
-
-    z_low = norm.ppf(alpha / 2)
-    z_high = norm.ppf(1 - alpha / 2)
-
-    adj_low = norm.cdf(z0 + (z0 + z_low) / (1 - a * (z0 + z_low)))
-    adj_high = norm.cdf(z0 + (z0 + z_high) / (1 - a * (z0 + z_high)))
-
-    low = np.quantile(boot_vals, adj_low)
-    high = np.quantile(boot_vals, adj_high)
-
-    return low, high, z0, a
-
-def dis_percentile_interval(boot_vals, conf=0.90):
-    alpha = 1 - conf
-    low = np.quantile(boot_vals, alpha / 2)
-    high = np.quantile(boot_vals, 1 - alpha / 2)
-    return low, high
-
-def dis_plot_profiles(ref_df, test_df, ref_summary, test_summary, selected, show_units=True, title="Dissolution Profiles", ylabel="% Dissolved"):
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ref_unit_cols = [c for c in ref_df.columns if c != "Time"]
-    test_unit_cols = [c for c in test_df.columns if c != "Time"]
-
-    if show_units:
-        for c in ref_unit_cols:
-            ax.plot(ref_df["Time"], ref_df[c], alpha=0.22, linewidth=1)
-        for c in test_unit_cols:
-            ax.plot(test_df["Time"], test_df[c], alpha=0.22, linewidth=1)
-
-    ax.plot(ref_summary["Time"], ref_summary["mean"], marker="o", linewidth=2, label="Reference mean")
-    ax.plot(test_summary["Time"], test_summary["mean"], marker="o", linewidth=2, label="Test mean")
-
-    ax.scatter(selected["Time"], selected["mean_ref"], marker="s", s=55, label="Selected ref points")
-    ax.scatter(selected["Time"], selected["mean_test"], marker="s", s=55, label="Selected test points")
-
-    ax.set_xlabel("Time", fontsize=12, weight="bold")
-    ax.set_ylabel(ylabel, fontsize=12, weight="bold")
-    ax.set_title(title, fontsize=15, weight="bold")
-    ax.legend(frameon=False)
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def dis_plot_bootstrap_f2_distribution(
-    boot_vals,
-    observed_f2,
-    ci_low=None,
-    ci_high=None,
-    ci_label="90% CI",
-    title="Distribution of f2 Similarity Factor",
-    x_min=50,
-    x_max=100
-):
-    boot_vals = np.asarray(boot_vals, dtype=float)
-    boot_vals = boot_vals[np.isfinite(boot_vals)]
-
-    if len(boot_vals) < 5:
-        print("Not enough bootstrap values to draw the distribution plot.")
+        s1 = {"upper": "Upper One-Sided", "lower": "Lower One-Sided", "two-sided": "Two-Sided"}[side]
+        s2 = {"ci": "Confidence Intervals", "pi": "Prediction Intervals", "both": "Confidence and Prediction Intervals"}[interval]
+        title = f"{s1} {s2} ({confidence:.0%})"
+
+    ax.set_title(title, pad=12)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=GRID_ALPHA)
+    if SHOW_LEGEND:
+        ax.legend(frameon=False, loc=LEGEND_LOC)
+    fig.tight_layout()
+    return fig, crossing_x
+
+
+def estimate_shelf_life(model, limit, decreasing=True, confidence=0.95, x_upper=100):
+    xg = np.linspace(0, x_upper, 1500)
+    X0 = np.column_stack([np.ones(len(xg)), xg])
+    fit = model["intercept"] + model["slope"] * xg
+    h = np.sum((X0 @ model["XtX_inv"]) * X0, axis=1)
+    tcrit = t.ppf(confidence, model["df"])  # one-sided
+    band = fit - tcrit * model["s"] * np.sqrt(h) if decreasing else fit + tcrit * model["s"] * np.sqrt(h)
+    idx = np.where(band <= limit)[0] if decreasing else np.where(band >= limit)[0]
+    shelf = float(xg[idx[0]]) if len(idx) else np.nan
+    return shelf, xg, fit, band
+
+
+def tolerance_interval_normal(data, p=0.95, conf=0.95, two_sided=True):
+    data = np.asarray(data, dtype=float)
+    n = len(data)
+    mean = data.mean()
+    sd = data.std(ddof=1)
+    if n < 2:
+        return np.nan, np.nan, np.nan
+    if two_sided:
+        g = norm.ppf((1 + p) / 2)
+        k = g * np.sqrt((n - 1) * (1 + 1 / n) / chi2.ppf(1 - conf, n - 1))
+        return mean, mean - k * sd, mean + k * sd
+    zp = norm.ppf(p)
+    k = nct.ppf(conf, n - 1, np.sqrt(n) * zp) / np.sqrt(n)
+    return mean, mean - k * sd, mean + k * sd
+
+
+def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR):
+    if scores.shape[0] < 3:
         return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    fig.patch.set_facecolor("#e6e6e6")
-    ax.set_facecolor("#f2f2f2")
-
-    sd_boot = np.std(boot_vals, ddof=1)
-
-    if sd_boot > 0:
-        kde = gaussian_kde(boot_vals)
-        x_lo = min(x_min, np.min(boot_vals) - 2 * sd_boot, observed_f2 - 5)
-        x_hi = max(x_max, np.max(boot_vals) + 2 * sd_boot, observed_f2 + 5)
-
-        if ci_low is not None:
-            x_lo = min(x_lo, ci_low - 3)
-        if ci_high is not None:
-            x_hi = max(x_hi, ci_high + 3)
-
-        x_grid = np.linspace(x_lo, x_hi, 600)
-        y_grid = kde(x_grid)
-        ax.plot(x_grid, y_grid, color="black", linewidth=1.6)
-        y_top = float(np.max(y_grid))
-    else:
-        ax.axvline(observed_f2, color="black", linewidth=1.6)
-        y_top = 1.0
-
-    ax.axvline(observed_f2, color="black", linestyle=(0, (4, 4)), linewidth=1.4)
-
-    if ci_low is not None:
-        ax.axvline(ci_low, color="#00aa44", linestyle=(0, (4, 4)), linewidth=1.4)
-    if ci_high is not None:
-        ax.axvline(ci_high, color="#00aa44", linestyle=(0, (4, 4)), linewidth=1.4)
-
-    ax.text(
-        observed_f2 - 0.8,
-        y_top * 0.52,
-        f"Original f2, {observed_f2:.1f}",
-        rotation=90,
-        ha="right",
-        va="center",
-        fontsize=11,
-        color="black",
-        weight="bold"
-    )
-
-    if ci_low is not None:
-        ax.text(
-            ci_low - 0.8,
-            y_top * 0.58,
-            f"{ci_label} Lower CI, {ci_low:.1f}",
-            rotation=90,
-            ha="right",
-            va="center",
-            fontsize=11,
-            color="#00aa44",
-            weight="bold"
-        )
-
-    if ci_high is not None:
-        ax.text(
-            ci_high + 0.8,
-            y_top * 0.58,
-            f"{ci_label} Upper CI, {ci_high:.1f}",
-            rotation=90,
-            ha="left",
-            va="center",
-            fontsize=11,
-            color="#00aa44",
-            weight="bold"
-        )
-
-    ax.set_title(title, fontsize=16, weight="bold", pad=18)
-    ax.set_xlabel("f2 Values", fontsize=12, weight="bold")
-    ax.set_ylabel("Density", fontsize=12, weight="bold")
-    ax.set_xlim(x_min, x_max)
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def ts_make_unique(names):
-    out = []
-    seen = {}
-    for i, n in enumerate(names):
-        n = str(n).strip()
-        if n == "" or n.lower() == "nan":
-            n = f"Col{i+1}"
-        if n in seen:
-            seen[n] += 1
-            n = f"{n}_{seen[n]}"
-        else:
-            seen[n] = 1
-        out.append(n)
-    return out
-
-def ts_parse_raw_table(text):
-    text = str(text).strip()
-    if not text:
-        raise ValueError("Paste data from Excel.")
-
-    parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", header=None, engine="python"),
-    ]
-
-    df = None
-    for parser in parsers:
-        try:
-            trial = parser(text)
-            if trial.shape[1] >= 2:
-                df = trial.copy()
-                break
-        except:
-            pass
-
-    if df is None or df.shape[1] < 2:
-        raise ValueError("Could not read the pasted table.")
-
-    df = df.dropna(how="all").reset_index(drop=True)
-    return df
-
-def ts_promote_header_if_needed(df_raw):
-    first_row = df_raw.iloc[0].astype(str).str.strip()
-    first_row_numeric = pd.to_numeric(first_row, errors="coerce").notna()
-
-    if first_row_numeric.all():
-        df = df_raw.copy()
-        df.columns = [f"Col{i+1}" for i in range(df.shape[1])]
-    else:
-        df = df_raw.iloc[1:].reset_index(drop=True).copy()
-        df.columns = ts_make_unique(first_row.tolist())
-
-    df.columns = ts_make_unique(df.columns)
-    return df
-
-def ts_to_numeric(series):
-    return pd.to_numeric(
-        series.astype(str).str.strip().str.replace("%", "", regex=False),
-        errors="coerce"
-    )
-
-def ts_guess_long_columns(df):
-    numericish = []
-    nonnumericish = []
-
-    for col in df.columns:
-        num = ts_to_numeric(df[col])
-        frac_numeric = num.notna().mean()
-        if frac_numeric >= 0.7:
-            numericish.append(col)
-        else:
-            nonnumericish.append(col)
-
-    response_col = numericish[-1] if len(numericish) > 0 else df.columns[-1]
-    group_col = nonnumericish[0] if len(nonnumericish) > 0 else df.columns[0]
-
-    if group_col == response_col and len(df.columns) >= 2:
-        for c in df.columns:
-            if c != response_col:
-                group_col = c
-                break
-
-    return group_col, response_col
-
-def ts_prepare_wide(df):
-    groups = {}
-    for col in df.columns:
-        vals = ts_to_numeric(df[col]).dropna().to_numpy(dtype=float)
-        if len(vals) > 0:
-            groups[str(col)] = vals
-
-    if len(groups) < 2:
-        raise ValueError("Wide format requires at least two non-empty numeric columns.")
-
-    for name, vals in groups.items():
-        if len(vals) < 2:
-            raise ValueError(f"Group '{name}' has fewer than 2 values.")
-
-    long_df = pd.concat(
-        [pd.DataFrame({"Group": name, "Response": vals}) for name, vals in groups.items()],
-        ignore_index=True
-    )
-
-    return long_df, groups
-
-def ts_prepare_wide_paired(df):
-    if df.shape[1] != 2:
-        raise ValueError("Paired mode currently requires exactly 2 columns in wide format.")
-
-    col1, col2 = df.columns[0], df.columns[1]
-
-    paired_df = pd.DataFrame({
-        str(col1): ts_to_numeric(df[col1]),
-        str(col2): ts_to_numeric(df[col2])
-    }).dropna().reset_index(drop=True)
-
-    if len(paired_df) < 2:
-        raise ValueError("At least 2 complete pairs are required.")
-
-    x1 = paired_df.iloc[:, 0].to_numpy(dtype=float)
-    x2 = paired_df.iloc[:, 1].to_numpy(dtype=float)
-
-    groups = {
-        str(col1): x1,
-        str(col2): x2
-    }
-
-    long_df = pd.concat(
-        [
-            pd.DataFrame({"Group": str(col1), "Response": x1}),
-            pd.DataFrame({"Group": str(col2), "Response": x2})
-        ],
-        ignore_index=True
-    )
-
-    return long_df, groups, str(col1), str(col2), x1, x2
-
-def ts_prepare_long(df, group_col, response_col):
-    dfa = df[[group_col, response_col]].copy()
-    dfa.columns = ["Group", "Response"]
-
-    dfa["Group"] = dfa["Group"].astype(str).str.strip()
-    dfa["Response"] = ts_to_numeric(dfa["Response"])
-    dfa = dfa.dropna(subset=["Group", "Response"])
-    dfa = dfa[dfa["Group"] != ""].reset_index(drop=True)
-
-    if dfa["Group"].nunique() < 2:
-        raise ValueError("Long format requires at least two group levels.")
-
-    groups = {
-        g: sub["Response"].to_numpy(dtype=float)
-        for g, sub in dfa.groupby("Group", sort=False)
-    }
-
-    for name, vals in groups.items():
-        if len(vals) < 2:
-            raise ValueError(f"Group '{name}' has fewer than 2 values.")
-
-    return dfa, groups
-
-def ts_group_summary(long_df):
-    return (
-        long_df.groupby("Group", sort=False)["Response"]
-        .agg(
-            n="size",
-            mean="mean",
-            sd="std",
-            median="median",
-            min="min",
-            max="max"
-        )
-        .reset_index()
-    )
-
-def ts_normality_table(groups, alpha):
-    rows = []
-    for name, vals in groups.items():
-        try:
-            a2_raw, p = normal_ad(vals)
-            n = len(vals)
-            a2_star = a2_raw * (1 + 0.75 / n + 2.25 / (n ** 2))
-        except:
-            a2_star, p = np.nan, np.nan
-
-        rows.append({
-            "Group": name,
-            "n": len(vals),
-            "AD_A_star": a2_star,
-            "AD_pvalue": p,
-            "Normal_at_alpha": "Yes" if (pd.notna(p) and p >= alpha) else "No"
-        })
-    return pd.DataFrame(rows)
-
-def ts_paired_difference_normality_table(x1, x2, alpha, name1="Group 1", name2="Group 2"):
-    diff = np.asarray(x1, dtype=float) - np.asarray(x2, dtype=float)
-
-    try:
-        a2_raw, p = normal_ad(diff)
-        n = len(diff)
-        a2_star = a2_raw * (1 + 0.75 / n + 2.25 / (n ** 2))
-    except:
-        a2_star, p = np.nan, np.nan
-
-    return pd.DataFrame([{
-        "Comparison": f"{name1} - {name2}",
-        "n_pairs": len(diff),
-        "AD_A_star": a2_star,
-        "AD_pvalue": p,
-        "Normal_at_alpha": "Yes" if (pd.notna(p) and p >= alpha) else "No"
-    }])
-
-def ts_variance_test(groups):
-    arrays = list(groups.values())
-    stat, p = stats.levene(*arrays, center="median")
-    return stat, p
-
-def ts_choose_test(groups, alpha, route_mode, design="independent", paired_data=None):
-    k = len(groups)
-
-    if design == "paired":
-        if paired_data is None:
-            raise ValueError("Paired data are required for paired design.")
-
-        name1, name2, x1, x2 = paired_data
-        norm_tbl = ts_paired_difference_normality_table(x1, x2, alpha, name1, name2)
-        diff_normal = bool(norm_tbl["Normal_at_alpha"].iloc[0] == "Yes")
-
-        if route_mode == "auto":
-            return ("paired_t" if diff_normal else "wilcoxon"), norm_tbl, np.nan, np.nan
-
-        if route_mode in ["parametric_equal", "welch"]:
-            return "paired_t", norm_tbl, np.nan, np.nan
-
-        if route_mode == "nonparametric":
-            return "wilcoxon", norm_tbl, np.nan, np.nan
-
-        raise ValueError("Invalid route mode for paired design.")
-
-    norm_tbl = ts_normality_table(groups, alpha)
-    all_normal = bool((norm_tbl["Normal_at_alpha"] == "Yes").all())
-
-    lev_stat, lev_p = ts_variance_test(groups)
-    equal_var = lev_p >= alpha
-
-    if route_mode == "auto":
-        if k == 2:
-            if all_normal and equal_var:
-                return "pooled_t", norm_tbl, lev_stat, lev_p
-            elif all_normal and not equal_var:
-                return "welch_t", norm_tbl, lev_stat, lev_p
-            else:
-                return "mannwhitney", norm_tbl, lev_stat, lev_p
-        else:
-            if all_normal and equal_var:
-                return "anova", norm_tbl, lev_stat, lev_p
-            elif all_normal and not equal_var:
-                return "welch_anova", norm_tbl, lev_stat, lev_p
-            else:
-                return "kruskal", norm_tbl, lev_stat, lev_p
-
-    if route_mode == "parametric_equal":
-        return ("pooled_t" if k == 2 else "anova"), norm_tbl, lev_stat, lev_p
-
-    if route_mode == "welch":
-        return ("welch_t" if k == 2 else "welch_anova"), norm_tbl, lev_stat, lev_p
-
-    if route_mode == "nonparametric":
-        return ("mannwhitney" if k == 2 else "kruskal"), norm_tbl, lev_stat, lev_p
-
-    raise ValueError("Invalid route mode.")
-
-def ts_run_test(groups, selected_test, paired_data=None):
-    names = list(groups.keys())
-    arrays = [groups[n] for n in names]
-
-    if selected_test == "paired_t":
-        if paired_data is None:
-            raise ValueError("Paired data are required for paired t-test.")
-        name1, name2, x1, x2 = paired_data
-        stat, p = stats.ttest_rel(x1, x2)
-        diffs = x1 - x2
-        return {
-            "Test": "Paired t-test",
-            "Statistic_name": "t",
-            "Statistic": stat,
-            "pvalue": p,
-            "Mean_difference": float(np.mean(diffs))
-        }
-
-    if selected_test == "wilcoxon":
-        if paired_data is None:
-            raise ValueError("Paired data are required for Wilcoxon signed-rank test.")
-        name1, name2, x1, x2 = paired_data
-        stat, p = stats.wilcoxon(x1, x2, alternative="two-sided", method="auto")
-        diffs = x1 - x2
-        return {
-            "Test": "Wilcoxon signed-rank test",
-            "Statistic_name": "W",
-            "Statistic": stat,
-            "pvalue": p,
-            "Median_difference": float(np.median(diffs))
-        }
-
-    if selected_test == "pooled_t":
-        stat, p = stats.ttest_ind(arrays[0], arrays[1], equal_var=True)
-        return {
-            "Test": "Pooled two-sample t-test",
-            "Statistic_name": "t",
-            "Statistic": stat,
-            "pvalue": p
-        }
-
-    if selected_test == "welch_t":
-        stat, p = stats.ttest_ind(arrays[0], arrays[1], equal_var=False)
-        return {
-            "Test": "Welch t-test",
-            "Statistic_name": "t",
-            "Statistic": stat,
-            "pvalue": p
-        }
-
-    if selected_test == "mannwhitney":
-        stat, p = stats.mannwhitneyu(arrays[0], arrays[1], alternative="two-sided", method="auto")
-        return {
-            "Test": "Mann-Whitney U test",
-            "Statistic_name": "U",
-            "Statistic": stat,
-            "pvalue": p
-        }
-
-    if selected_test == "anova":
-        stat, p = stats.f_oneway(*arrays)
-        return {
-            "Test": "One-way ANOVA",
-            "Statistic_name": "F",
-            "Statistic": stat,
-            "pvalue": p
-        }
-
-    if selected_test == "welch_anova":
-        res = anova_oneway(arrays, use_var="unequal")
-        return {
-            "Test": "Welch ANOVA",
-            "Statistic_name": "F",
-            "Statistic": float(res.statistic),
-            "pvalue": float(res.pvalue)
-        }
-
-    if selected_test == "kruskal":
-        stat, p = stats.kruskal(*arrays)
-        return {
-            "Test": "Kruskal-Wallis test",
-            "Statistic_name": "H",
-            "Statistic": stat,
-            "pvalue": p
-        }
-
-    raise ValueError("Unknown test.")
-
-def ts_plot_groups(long_df, title="Group Comparison", ylabel="Response", show_points=True, design="independent"):
-    groups = list(pd.unique(long_df["Group"]))
-    data = [long_df.loc[long_df["Group"] == g, "Response"].to_numpy() for g in groups]
-
-    colors = ["black", "firebrick"]
-
-    plt.figure(figsize=(9.5, 6))
-
-    bp = plt.boxplot(
-        data,
-        tick_labels=groups,
-        showmeans=False,
-        patch_artist=False,
-        boxprops=dict(linewidth=1.5),
-        whiskerprops=dict(linewidth=1.5),
-        capprops=dict(linewidth=1.5),
-        medianprops=dict(linewidth=1.8),
-        flierprops=dict(marker="o", markersize=4)
-    )
-
-    for i, box in enumerate(bp["boxes"]):
-        color = colors[i % len(colors)]
-        box.set_color(color)
-
-    for i, whisker in enumerate(bp["whiskers"]):
-        color = colors[(i // 2) % len(colors)]
-        whisker.set_color(color)
-
-    for i, cap in enumerate(bp["caps"]):
-        color = colors[(i // 2) % len(colors)]
-        cap.set_color(color)
-
-    for i, median in enumerate(bp["medians"]):
-        color = colors[i % len(colors)]
-        median.set_color(color)
-
-    for i, flier in enumerate(bp["fliers"]):
-        color = colors[i % len(colors)]
-        flier.set_markeredgecolor(color)
-        flier.set_markerfacecolor(color)
-
-    if show_points:
-        rng = np.random.default_rng(12345)
-        for i, vals in enumerate(data, start=1):
-            color = colors[(i - 1) % len(colors)]
-            jitter = rng.uniform(-0.08, 0.08, size=len(vals))
-            plt.scatter(
-                np.full(len(vals), i) + jitter,
-                vals,
-                alpha=0.45,
-                s=20,
-                color=color,
-                zorder=3
-            )
-
-    if design == "paired" and len(groups) == 2 and len(data[0]) == len(data[1]):
-        x1, x2 = 1, 2
-        for y1, y2 in zip(data[0], data[1]):
-            plt.plot([x1, x2], [y1, y2], color="gray", alpha=0.5, linewidth=1.0, zorder=1)
-
-    for i, vals in enumerate(data, start=1):
-        color = colors[(i - 1) % len(colors)]
-        mean_val = np.mean(vals)
-        plt.scatter(
-            i,
-            mean_val,
-            marker="x",
-            s=90,
-            linewidths=2.0,
-            color=color,
-            zorder=4
-        )
-
-    plt.xlabel("Group", fontsize=12, weight="bold")
-    plt.ylabel(ylabel, fontsize=12, weight="bold")
-    plt.title(title, fontsize=15, weight="bold")
-    plt.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def twa_parse_pasted_table(text):
-    text = str(text).strip()
-    if not text:
-        raise ValueError("Paste a table from Excel.")
-
-    parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", engine="python"),
-    ]
-
-    df = None
-    for parser in parsers:
-        try:
-            trial = parser(text)
-            if trial.shape[1] >= 3:
-                df = trial.copy()
-                break
-        except:
-            pass
-
-    if df is None or df.shape[1] < 3:
-        raise ValueError("Could not read the table. Paste at least 3 columns with headers.")
-
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    return df
-
-def twa_clean_dataframe(df):
-    out = df.copy()
-    for col in out.columns:
-        if out[col].dtype == object:
-            out[col] = out[col].astype(str).str.strip()
-    return out
-
-def twa_guess_columns(df):
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="coerce"))]
-    non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
-
-    response = numeric_cols[-1] if numeric_cols else df.columns[-1]
-    factors = [c for c in df.columns if c != response]
-
-    factor_a = factors[0] if len(factors) >= 1 else df.columns[0]
-    factor_b = factors[1] if len(factors) >= 2 else df.columns[1] if len(df.columns) > 1 else df.columns[0]
-
-    return response, factor_a, factor_b
-
-def twa_prepare_analysis_df(df, response_col, factor_a_col, factor_b_col):
-    dfa = df[[response_col, factor_a_col, factor_b_col]].copy()
-    dfa.columns = ["Response", "FactorA", "FactorB"]
-
-    dfa["Response"] = pd.to_numeric(
-        dfa["Response"].astype(str).str.replace("%", "", regex=False).str.strip(),
-        errors="coerce"
-    )
-
-    dfa["FactorA"] = dfa["FactorA"].astype(str).str.strip()
-    dfa["FactorB"] = dfa["FactorB"].astype(str).str.strip()
-
-    dfa = dfa.dropna(subset=["Response", "FactorA", "FactorB"]).reset_index(drop=True)
-
-    if len(dfa) < 4:
-        raise ValueError("Not enough valid rows after cleaning.")
-    if dfa["FactorA"].nunique() < 2:
-        raise ValueError("Factor A must have at least 2 levels.")
-    if dfa["FactorB"].nunique() < 2:
-        raise ValueError("Factor B must have at least 2 levels.")
-
-    return dfa
-
-def twa_fit_model(df_analysis, include_interaction=True, typ=2):
-    formula = "Response ~ C(FactorA) + C(FactorB)"
-    if include_interaction:
-        formula += " + C(FactorA):C(FactorB)"
-
-    model = smf.ols(formula, data=df_analysis).fit()
-    anova_tbl = anova_lm(model, typ=typ).reset_index().rename(columns={"index": "Source"})
-
-    if "sum_sq" in anova_tbl.columns:
-        total_ss = anova_tbl["sum_sq"].sum()
-        if total_ss > 0:
-            anova_tbl["Pct_SS"] = 100 * anova_tbl["sum_sq"] / total_ss
-
-    return model, anova_tbl
-
-def twa_make_group_summary(df_analysis):
-    summary = (
-        df_analysis
-        .groupby(["FactorA", "FactorB"], dropna=False)
-        .agg(
-            n=("Response", "size"),
-            mean=("Response", "mean"),
-            sd=("Response", "std"),
-            sem=("Response", lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan),
-            min=("Response", "min"),
-            max=("Response", "max")
-        )
-        .reset_index()
-    )
-    return summary
-
-def twa_make_means_table(df_analysis):
-    means = df_analysis.pivot_table(
-        index="FactorA",
-        columns="FactorB",
-        values="Response",
-        aggfunc="mean"
-    )
-    return means
-
-def twa_make_counts_table(df_analysis):
-    counts = df_analysis.pivot_table(
-        index="FactorA",
-        columns="FactorB",
-        values="Response",
-        aggfunc="size"
-    )
-    return counts
-
-def twa_plot_interaction(df_analysis, ylabel="Response", title="Interaction Plot", show_points=True):
-    means = (
-        df_analysis
-        .groupby(["FactorA", "FactorB"], dropna=False)["Response"]
-        .mean()
-        .reset_index()
-    )
-
-    factor_a_levels = list(pd.unique(df_analysis["FactorA"]))
-    factor_b_levels = list(pd.unique(df_analysis["FactorB"]))
-
-    plt.figure(figsize=(9.5, 6))
-
-    x = np.arange(len(factor_a_levels))
-
-    for b in factor_b_levels:
-        sub = means[means["FactorB"] == b].copy()
-        yvals = []
-        for a in factor_a_levels:
-            match = sub.loc[sub["FactorA"] == a, "Response"]
-            yvals.append(match.iloc[0] if len(match) > 0 else np.nan)
-
-        plt.plot(x, yvals, marker="o", linewidth=1.8, label=str(b))
-
-    if show_points:
-        jitter = np.linspace(-0.08, 0.08, max(2, len(factor_b_levels)))
-        for j, b in enumerate(factor_b_levels):
-            sub_raw = df_analysis[df_analysis["FactorB"] == b]
-            for i, a in enumerate(factor_a_levels):
-                vals = sub_raw.loc[sub_raw["FactorA"] == a, "Response"].to_numpy()
-                if len(vals) > 0:
-                    plt.scatter(np.full(len(vals), x[i] + jitter[j]), vals, alpha=0.35, s=18)
-
-    plt.xticks(x, factor_a_levels)
-    plt.xlabel("Factor A", fontsize=12, weight="bold")
-    plt.ylabel(ylabel, fontsize=12, weight="bold")
-    plt.title(title, fontsize=15, weight="bold")
-    plt.legend(title="Factor B", frameon=False)
-    plt.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def tc_make_unique(names):
-    out = []
-    seen = {}
-    for i, n in enumerate(names):
-        n = str(n).strip()
-        if n == "" or n.lower() == "nan":
-            n = f"Col{i+1}"
-        if n in seen:
-            seen[n] += 1
-            n = f"{n}_{seen[n]}"
-        else:
-            seen[n] = 1
-        out.append(n)
-    return out
-
-def tc_parse_raw_table(text):
-    text = str(text).strip()
-    if not text:
-        raise ValueError("Paste data from Excel.")
-
-    parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", header=None, engine="python"),
-    ]
-
-    df = None
-    for parser in parsers:
-        try:
-            trial = parser(text)
-            if trial.shape[1] >= 2:
-                df = trial.copy()
-                break
-        except:
-            pass
-
-    if df is None or df.shape[1] < 2:
-        raise ValueError("Could not read the pasted table.")
-
-    df = df.dropna(how="all").reset_index(drop=True)
-    return df
-
-def tc_promote_header_if_needed(df_raw):
-    first_row = df_raw.iloc[0].astype(str).str.strip()
-    first_row_numeric = pd.to_numeric(first_row, errors="coerce").notna()
-
-    if first_row_numeric.all():
-        df = df_raw.copy()
-        df.columns = [f"Col{i+1}" for i in range(df.shape[1])]
-    else:
-        df = df_raw.iloc[1:].reset_index(drop=True).copy()
-        df.columns = tc_make_unique(first_row.tolist())
-
-    df.columns = tc_make_unique(df.columns)
-    return df
-
-def tc_to_numeric(series):
-    return pd.to_numeric(
-        series.astype(str).str.strip().str.replace("%", "", regex=False),
-        errors="coerce"
-    )
-
-def tc_guess_long_columns(df):
-    numericish = []
-    nonnumericish = []
-
-    for col in df.columns:
-        num = tc_to_numeric(df[col])
-        frac_numeric = num.notna().mean()
-        if frac_numeric >= 0.7:
-            numericish.append(col)
-        else:
-            nonnumericish.append(col)
-
-    response_col = numericish[-1] if len(numericish) > 0 else df.columns[-1]
-    group_col = nonnumericish[0] if len(nonnumericish) > 0 else df.columns[0]
-
-    if group_col == response_col and len(df.columns) >= 2:
-        for c in df.columns:
-            if c != response_col:
-                group_col = c
-                break
-
-    return group_col, response_col
-
-def tc_prepare_wide(df):
-    groups = {}
-    for col in df.columns:
-        vals = tc_to_numeric(df[col]).dropna().to_numpy(dtype=float)
-        if len(vals) > 0:
-            groups[str(col)] = vals
-
-    if len(groups) != 2:
-        raise ValueError("Wide format for this app must contain exactly two non-empty numeric columns.")
-    for name, vals in groups.items():
-        if len(vals) < 2:
-            raise ValueError(f"Group '{name}' has fewer than 2 values.")
-
-    long_df = pd.concat(
-        [pd.DataFrame({"Group": name, "Response": vals}) for name, vals in groups.items()],
-        ignore_index=True
-    )
-    return long_df, groups
-
-def tc_prepare_long(df, group_col, response_col):
-    dfa = df[[group_col, response_col]].copy()
-    dfa.columns = ["Group", "Response"]
-
-    dfa["Group"] = dfa["Group"].astype(str).str.strip()
-    dfa["Response"] = tc_to_numeric(dfa["Response"])
-    dfa = dfa.dropna(subset=["Group", "Response"])
-    dfa = dfa[dfa["Group"] != ""].reset_index(drop=True)
-
-    groups = {
-        g: sub["Response"].to_numpy(dtype=float)
-        for g, sub in dfa.groupby("Group", sort=False)
-    }
-
-    if len(groups) != 2:
-        raise ValueError("Long format for this app must contain exactly two groups.")
-    for name, vals in groups.items():
-        if len(vals) < 2:
-            raise ValueError(f"Group '{name}' has fewer than 2 values.")
-
-    return dfa, groups
-
-def tc_ad_table(groups, alpha):
-    rows = []
-    for name, vals in groups.items():
-        try:
-            a2_raw, p = normal_ad(vals)
-            n = len(vals)
-            a2_star = a2_raw * (1 + 0.75 / n + 2.25 / (n ** 2))
-        except:
-            a2_star, p = np.nan, np.nan
-
-        rows.append({
-            "Group": name,
-            "n": len(vals),
-            "AD_A_star": a2_star,
-            "AD_pvalue": p,
-            "Normal_at_alpha": "Yes" if (pd.notna(p) and p >= alpha) else "No"
-        })
-    return pd.DataFrame(rows)
-
-def tc_group_summary(groups):
-    rows = []
-    for name, vals in groups.items():
-        vals = np.asarray(vals, dtype=float)
-        rows.append({
-            "Group": name,
-            "n": len(vals),
-            "mean": np.mean(vals),
-            "sd": np.std(vals, ddof=1),
-            "median": np.median(vals),
-            "min": np.min(vals),
-            "max": np.max(vals)
-        })
-    return pd.DataFrame(rows)
-
-def tc_mean_ci(x, conf=0.95):
-    x = np.asarray(x, dtype=float)
-    n = len(x)
-    mean = np.mean(x)
-    sd = np.std(x, ddof=1)
-    se = sd / np.sqrt(n)
-    tcrit = t.ppf(1 - (1 - conf) / 2, n - 1)
-    lcl = mean - tcrit * se
-    ucl = mean + tcrit * se
-    return {
-        "n": n,
-        "mean": mean,
-        "sd": sd,
-        "se": se,
-        "df": n - 1,
-        "CI_confidence": conf,
-        "CI_lower": lcl,
-        "CI_upper": ucl
-    }
-
-def tc_diff_mean_ci(x1, x2, conf=0.95, method="auto", alpha_var=0.05):
-    x1 = np.asarray(x1, dtype=float)
-    x2 = np.asarray(x2, dtype=float)
-
-    n1, n2 = len(x1), len(x2)
-    m1, m2 = np.mean(x1), np.mean(x2)
-    s1, s2 = np.std(x1, ddof=1), np.std(x2, ddof=1)
-    diff = m1 - m2
-
-    lev_stat, lev_p = stats.levene(x1, x2, center="median")
-    equal_var = lev_p >= alpha_var
-
-    if method == "auto":
-        method_used = "pooled" if equal_var else "welch"
-    else:
-        method_used = method
-
-    if method_used == "pooled":
-        sp2 = ((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / (n1 + n2 - 2)
-        se = np.sqrt(sp2 * (1 / n1 + 1 / n2))
-        df = n1 + n2 - 2
-    else:
-        se = np.sqrt(s1**2 / n1 + s2**2 / n2)
-        num = (s1**2 / n1 + s2**2 / n2) ** 2
-        den = ((s1**2 / n1) ** 2) / (n1 - 1) + ((s2**2 / n2) ** 2) / (n2 - 1)
-        df = num / den
-
-    tcrit = t.ppf(1 - (1 - conf) / 2, df)
-    lcl = diff - tcrit * se
-    ucl = diff + tcrit * se
-
-    return {
-        "Comparison": f"{list(['Group1','Group2'])}",
-        "Mean_diff_G1_minus_G2": diff,
-        "SE": se,
-        "df": df,
-        "Method": method_used,
-        "Levene_stat": lev_stat,
-        "Levene_pvalue": lev_p,
-        "Equal_variance_at_alpha": "Yes" if equal_var else "No",
-        "CI_confidence": conf,
-        "CI_lower": lcl,
-        "CI_upper": ucl
-    }
-
-def tc_one_sided_ti(x, conf=0.95, coverage=0.95, side="upper"):
-    x = np.asarray(x, dtype=float)
-    n = len(x)
-    mean = np.mean(x)
-    sd = np.std(x, ddof=1)
-
-    zp = norm.ppf(coverage)
-    k = nct.ppf(conf, df=n - 1, nc=np.sqrt(n) * zp) / np.sqrt(n)
-
-    if side == "upper":
-        lower = np.nan
-        upper = mean + k * sd
-    else:
-        lower = mean - k * sd
-        upper = np.nan
-
-    return {
-        "n": n,
-        "mean": mean,
-        "sd": sd,
-        "Tolerance_confidence": conf,
-        "Tolerance_coverage": coverage,
-        "Tolerance_side": side,
-        "Method": "Exact one-sided noncentral t",
-        "k_factor": k,
-        "TI_lower": lower,
-        "TI_upper": upper
-    }
-
-def tc_two_sided_ti_howe(x, conf=0.95, coverage=0.95):
-    x = np.asarray(x, dtype=float)
-    n = len(x)
-    mean = np.mean(x)
-    sd = np.std(x, ddof=1)
-
-    alpha = 1 - conf
-    z = norm.ppf((1 + coverage) / 2)
-    chi = chi2.ppf(alpha, n - 1)
-    k = z * np.sqrt((n - 1) * (1 + 1 / n) / chi)
-
-    return {
-        "n": n,
-        "mean": mean,
-        "sd": sd,
-        "Tolerance_confidence": conf,
-        "Tolerance_coverage": coverage,
-        "Tolerance_side": "two-sided",
-        "Method": "Howe two-sided approximation",
-        "k_factor": k,
-        "TI_lower": mean - k * sd,
-        "TI_upper": mean + k * sd
-    }
-
-def tc_ti_table(groups, conf=0.95, coverage=0.95, side="two-sided"):
-    rows = []
-    for name, vals in groups.items():
-        if side == "two-sided":
-            res = tc_two_sided_ti_howe(vals, conf=conf, coverage=coverage)
-        else:
-            res = tc_one_sided_ti(vals, conf=conf, coverage=coverage, side=side)
-        res["Group"] = name
-        rows.append(res)
-    cols = [
-        "Group", "n", "mean", "sd", "Tolerance_side", "Tolerance_confidence",
-        "Tolerance_coverage", "Method", "k_factor", "TI_lower", "TI_upper"
-    ]
-    return pd.DataFrame(rows)[cols]
-
-def tc_ci_table(groups, conf=0.95):
-    rows = []
-    for name, vals in groups.items():
-        res = tc_mean_ci(vals, conf=conf)
-        res["Group"] = name
-        rows.append(res)
-    cols = ["Group", "n", "mean", "sd", "se", "df", "CI_confidence", "CI_lower", "CI_upper"]
-    return pd.DataFrame(rows)[cols]
-
-def tc_plot_intervals(long_df, ci_tbl, ti_tbl, title="Intervals by Group", ylabel="Response", show_points=True):
-    groups = list(ci_tbl["Group"])
-    x_positions = np.arange(1, len(groups) + 1)
-
-    fig, ax = plt.subplots(figsize=(9.5, 6))
-
-    if show_points:
-        rng = np.random.default_rng(12345)
-        for i, g in enumerate(groups, start=1):
-            vals = long_df.loc[long_df["Group"] == g, "Response"].to_numpy(dtype=float)
-            jitter = rng.uniform(-0.06, 0.06, size=len(vals))
-            ax.scatter(np.full(len(vals), i) + jitter, vals, alpha=0.45, s=22)
-
-    for i, g in enumerate(groups):
-        x = x_positions[i]
-        mean = float(ci_tbl.loc[ci_tbl["Group"] == g, "mean"].iloc[0])
-        ci_l = float(ci_tbl.loc[ci_tbl["Group"] == g, "CI_lower"].iloc[0])
-        ci_u = float(ci_tbl.loc[ci_tbl["Group"] == g, "CI_upper"].iloc[0])
-
-        ax.vlines(x - 0.08, ci_l, ci_u, linewidth=2.4)
-        ax.hlines([ci_l, ci_u], x - 0.14, x - 0.02, linewidth=2.0)
-        ax.scatter([x - 0.08], [mean], marker="s", s=45)
-
-        ti_l = ti_tbl.loc[ti_tbl["Group"] == g, "TI_lower"].iloc[0]
-        ti_u = ti_tbl.loc[ti_tbl["Group"] == g, "TI_upper"].iloc[0]
-        side = ti_tbl.loc[ti_tbl["Group"] == g, "Tolerance_side"].iloc[0]
-
-        if side == "two-sided":
-            ax.vlines(x + 0.08, ti_l, ti_u, linewidth=1.8, linestyles="--")
-            ax.hlines([ti_l, ti_u], x + 0.02, x + 0.14, linewidth=1.6, linestyles="--")
-        elif side == "upper" and pd.notna(ti_u):
-            ax.vlines(x + 0.08, mean, ti_u, linewidth=1.8, linestyles="--")
-            ax.hlines(ti_u, x + 0.02, x + 0.14, linewidth=1.6, linestyles="--")
-        elif side == "lower" and pd.notna(ti_l):
-            ax.vlines(x + 0.08, ti_l, mean, linewidth=1.8, linestyles="--")
-            ax.hlines(ti_l, x + 0.02, x + 0.14, linewidth=1.6, linestyles="--")
-
-        ax.scatter([x], [mean], s=30)
-
-    from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0], [0], linestyle="-", linewidth=2.4, label="Mean CI"),
-        Line2D([0], [0], linestyle="--", linewidth=1.8, label="Tolerance interval/bound"),
-        Line2D([0], [0], marker="o", linestyle="", label="Mean")
-    ]
-    if show_points:
-        handles.append(Line2D([0], [0], marker="o", linestyle="", alpha=0.45, label="Raw points"))
-
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(groups)
-    ax.set_xlabel("Group", fontsize=12, weight="bold")
-    ax.set_ylabel(ylabel, fontsize=12, weight="bold")
-    ax.set_title(title, fontsize=15, weight="bold")
-    ax.legend(handles=handles, frameon=False, loc="best")
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def pca_make_unique(names):
-    out = []
-    seen = {}
-    for i, n in enumerate(names):
-        n = str(n).strip()
-        if n == "" or n.lower() == "nan":
-            n = f"Col{i+1}"
-        if n in seen:
-            seen[n] += 1
-            n = f"{n}_{seen[n]}"
-        else:
-            seen[n] = 1
-        out.append(n)
-    return out
-
-def pca_parse_table(text):
-    text = str(text).strip()
-    if not text:
-        raise ValueError("Paste a table with headers from Excel.")
-
-    parsers = [
-        lambda s: pd.read_csv(StringIO(s), sep="\t", engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=",", engine="python"),
-        lambda s: pd.read_csv(StringIO(s), sep=";", engine="python"),
-    ]
-
-    df = None
-    for parser in parsers:
-        try:
-            trial = parser(text)
-            if trial.shape[1] >= 2:
-                df = trial.copy()
-                break
-        except:
-            pass
-
-    if df is None or df.shape[1] < 2:
-        raise ValueError("Could not read the pasted table.")
-
-    df.columns = pca_make_unique(df.columns)
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].astype(str).str.strip()
-
-    return df
-
-def pca_numeric_candidates(df, min_fraction=0.7):
-    numeric_cols = []
-    for col in df.columns:
-        vals = pd.to_numeric(
-            df[col].astype(str).str.replace("%", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-        if vals.notna().mean() >= min_fraction:
-            numeric_cols.append(col)
-    return numeric_cols
-
-def pca_prepare_matrix(df, feature_cols, label_col=None, group_col=None):
-    dfa = df.copy()
-
-    X = pd.DataFrame(index=dfa.index)
-    for col in feature_cols:
-        X[col] = pd.to_numeric(
-            dfa[col].astype(str).str.replace("%", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-
-    keep = X.notna().all(axis=1)
-    X = X.loc[keep].reset_index(drop=True)
-
-    meta = pd.DataFrame(index=np.arange(len(X)))
-
-    if label_col is None or label_col == "(None)":
-        meta["Label"] = [f"Obs{i+1}" for i in range(len(X))]
-    else:
-        meta["Label"] = dfa.loc[keep, label_col].astype(str).reset_index(drop=True)
-
-    if group_col is None or group_col == "(None)":
-        meta["Group"] = "All"
-    else:
-        meta["Group"] = dfa.loc[keep, group_col].astype(str).reset_index(drop=True)
-
-    if X.shape[0] < 2:
-        raise ValueError("Not enough complete rows after removing missing values.")
-    if X.shape[1] < 2:
-        raise ValueError("Choose at least two numeric variables.")
-
-    return X, meta
-
-def pca_preprocess(X, mode):
-    Xv = X.to_numpy(dtype=float)
-    means = Xv.mean(axis=0)
-    sds = Xv.std(axis=0, ddof=1)
-
-    if mode == "none":
-        Xp = Xv.copy()
-    elif mode == "center":
-        Xp = Xv - means
-    elif mode == "autoscale":
-        sds_safe = np.where(sds == 0, 1.0, sds)
-        Xp = (Xv - means) / sds_safe
-    else:
-        raise ValueError("Invalid preprocessing mode.")
-
-    prep_info = pd.DataFrame({
-        "Variable": X.columns,
-        "Mean": means,
-        "SD": sds
-    })
-
-    return Xp, prep_info
-
-def pca_run(X, n_components):
-    pca = PCA(n_components=n_components)
-    scores = pca.fit_transform(X)
-
-    score_cols = [f"PC{i+1}" for i in range(scores.shape[1])]
-    scores_df = pd.DataFrame(scores, columns=score_cols)
-
-    loadings = pca.components_.T
-    loading_cols = [f"PC{i+1}" for i in range(loadings.shape[1])]
-    loadings_df = pd.DataFrame(loadings, index=None, columns=loading_cols)
-
-    explained_df = pd.DataFrame({
-        "PC": [f"PC{i+1}" for i in range(len(pca.explained_variance_ratio_))],
-        "Eigenvalue": pca.explained_variance_,
-        "Explained_Variance_%": 100 * pca.explained_variance_ratio_,
-        "Cumulative_%": 100 * np.cumsum(pca.explained_variance_ratio_)
-    })
-
-    return pca, scores_df, loadings_df, explained_df
-
-def pca_plot_scree(explained_df, title="Scree Plot"):
-    x = np.arange(1, len(explained_df) + 1)
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(x, explained_df["Explained_Variance_%"].to_numpy(), marker="o")
-    plt.xticks(x, [f"PC{i}" for i in x])
-    plt.xlabel("Principal Component", fontsize=12, weight="bold")
-    plt.ylabel("Explained Variance (%)", fontsize=12, weight="bold")
-    plt.title(title, fontsize=15, weight="bold")
-    plt.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def pca_plot_cumulative(explained_df, title="Cumulative Explained Variance"):
-    x = np.arange(1, len(explained_df) + 1)
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(x, explained_df["Cumulative_%"].to_numpy(), marker="o")
-    plt.xticks(x, [f"PC{i}" for i in x])
-    plt.xlabel("Principal Component", fontsize=12, weight="bold")
-    plt.ylabel("Cumulative Variance (%)", fontsize=12, weight="bold")
-    plt.title(title, fontsize=15, weight="bold")
-    plt.ylim(0, 105)
-    plt.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def pca_ellipse_scale(mode):
-    if mode == "none":
-        return None
-    if mode == "3sigma":
-        return 3.0
-    if mode == "mahal_95":
-        return np.sqrt(5.991464547107979)   # chi-square df=2, 95%
-    if mode == "mahal_99":
-        return np.sqrt(9.21034037197618)    # chi-square df=2, 99%
-    raise ValueError("Invalid ellipse mode.")
-
-def pca_add_confidence_ellipse(ax, x, y, mode="3sigma", label=None, linewidth=1.5, color=None):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-
-    if len(x) < 3:
-        return
-
-    scale = pca_ellipse_scale(mode)
-    if scale is None:
-        return
-
-    cov = np.cov(x, y)
-    if cov.shape != (2, 2):
-        return
-
-    vals, vecs = np.linalg.eigh(cov)
-    order = vals.argsort()[::-1]
-    vals = vals[order]
-    vecs = vecs[:, order]
-
-    if np.any(vals < 0):
-        return
-
-    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
-    width = 2 * scale * np.sqrt(vals[0])
-    height = 2 * scale * np.sqrt(vals[1])
-
-    ellipse = Ellipse(
-        xy=(np.mean(x), np.mean(y)),
-        width=width,
-        height=height,
-        angle=angle,
-        fill=False,
-        edgecolor=color,
-        linewidth=linewidth,
-        label=label
-    )
-    ax.add_patch(ellipse)
-
-def pca_plot_scores(
-    scores_df,
-    meta_df,
-    explained_df,
-    show_labels=True,
-    title="Scores Plot",
-    ellipse_mode="none",
-    ellipse_scope="overall"
-):
-    if scores_df.shape[1] < 2:
-        raise ValueError("Need at least 2 PCs to draw a scores plot.")
-
-    pc1_name = "PC1"
-    pc2_name = "PC2"
-    xlab = f"{pc1_name} ({explained_df.loc[0, 'Explained_Variance_%']:.2f}%)"
-    ylab = f"{pc2_name} ({explained_df.loc[1, 'Explained_Variance_%']:.2f}%)"
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    groups = pd.unique(meta_df["Group"])
-    group_colors = {}
-
-    for g in groups:
-        mask = meta_df["Group"] == g
-        sc = ax.scatter(
-            scores_df.loc[mask, pc1_name],
-            scores_df.loc[mask, pc2_name],
-            label=str(g),
-            alpha=0.8,
-            s=40
-        )
-
-        color = sc.get_facecolor()[0]
-        group_colors[g] = color
-
-    if show_labels:
-        for i in range(len(scores_df)):
-            ax.text(
-                scores_df.loc[i, pc1_name],
-                scores_df.loc[i, pc2_name],
-                str(meta_df.loc[i, "Label"]),
-                fontsize=9
-            )
-
-    if ellipse_mode != "none":
-        if ellipse_scope == "overall":
-            pca_add_confidence_ellipse(
-                ax,
-                scores_df[pc1_name].to_numpy(),
-                scores_df[pc2_name].to_numpy(),
-                mode=ellipse_mode,
-                label="Ellipse",
-                color="black"
-            )
-        elif ellipse_scope == "by_group":
-            for g in groups:
-                mask = meta_df["Group"] == g
-                pca_add_confidence_ellipse(
-                    ax,
-                    scores_df.loc[mask, pc1_name].to_numpy(),
-                    scores_df.loc[mask, pc2_name].to_numpy(),
-                    mode=ellipse_mode,
-                    label=f"{g} ellipse",
-                    color=group_colors[g]
-                )
-
-    ax.axhline(0, linewidth=1)
-    ax.axvline(0, linewidth=1)
-    ax.set_xlabel(xlab, fontsize=12, weight="bold")
-    ax.set_ylabel(ylab, fontsize=12, weight="bold")
-    ax.set_title(title, fontsize=15, weight="bold")
-
-    if len(groups) > 1 or str(groups[0]) != "All" or ellipse_mode != "none":
-        ax.legend(frameon=False, title="Group")
-
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-def pca_plot_loadings(loadings_df, variable_names, explained_df, title="Loadings Plot"):
-    if loadings_df.shape[1] < 2:
-        raise ValueError("Need at least 2 PCs to draw a loadings plot.")
-
-    pc1 = loadings_df["PC1"].to_numpy()
-    pc2 = loadings_df["PC2"].to_numpy()
-
-    plt.figure(figsize=(8, 6))
-    plt.axhline(0, linewidth=1)
-    plt.axvline(0, linewidth=1)
-
-    for i, var in enumerate(variable_names):
-        plt.arrow(0, 0, pc1[i], pc2[i], head_width=0.03, length_includes_head=True)
-        plt.text(pc1[i], pc2[i], str(var), fontsize=10)
-
-    lim = max(1.0, np.max(np.abs(np.concatenate([pc1, pc2]))) * 1.2)
-    plt.xlim(-lim, lim)
-    plt.ylim(-lim, lim)
-
-    xlab = f"PC1 ({explained_df.loc[0, 'Explained_Variance_%']:.2f}%)"
-    ylab = f"PC2 ({explained_df.loc[1, 'Explained_Variance_%']:.2f}%)"
-
-    plt.xlabel(xlab, fontsize=12, weight="bold")
-    plt.ylabel(ylab, fontsize=12, weight="bold")
-    plt.title(title, fontsize=15, weight="bold")
-    plt.grid(False)
-    plt.tight_layout()
-    plt.show()
-
-
-
-# ------------------------------
-# Shared Streamlit helpers
-# ------------------------------
-def round_df(df, decimals=4):
-    out = df.copy()
-    for col in out.columns:
-        if pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].round(decimals)
-    return out
-
-def display_df(df, decimals=4):
-    st.dataframe(round_df(df, decimals), use_container_width=True)
-
-def render_plot(plot_func, *args, **kwargs):
-    plt.close("all")
-    plot_func(*args, **kwargs)
-    fig = plt.gcf()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-def safe_parse_float(text, default=None):
-    text = str(text).strip()
-    if text == "":
-        return default
-    return float(text)
-
-# ------------------------------
-# Sample data
-# ------------------------------
-SHELF_SAMPLE_DATA = "0\t100\n3\t99.2\n6\t98.4\n9\t97.8\n12\t97.0\n18\t95.6\n24\t94.8"
-SHELF_SAMPLE_PRED = "30\n36\n48"
-
-DISS_REF_SAMPLE = """Time\tR1\tR2\tR3\tR4\tR5\tR6
-5\t28\t30\t27\t29\t31\t28
-10\t52\t54\t51\t53\t55\t52
-15\t71\t73\t70\t72\t74\t71
-20\t84\t86\t83\t85\t87\t84
-30\t93\t94\t92\t93\t95\t93
-45\t97\t98\t96\t97\t98\t97
-"""
-
-DISS_TEST_SAMPLE = """Time\tT1\tT2\tT3\tT4\tT5\tT6
-5\t26\t28\t25\t27\t29\t26
-10\t49\t51\t48\t50\t52\t49
-15\t69\t70\t68\t69\t71\t68
-20\t82\t84\t81\t83\t85\t82
-30\t92\t93\t91\t92\t94\t92
-45\t97\t97\t96\t97\t98\t97
-"""
-
-TS_WIDE_SAMPLE = """Reference\tTest
-98.1\t97.4
-97.9\t97.8
-98.4\t97.5
-98.0\t97.9
-98.3\t97.6
-"""
-
-TS_LONG_SAMPLE = """Group\tResponse
-A\t12.1
-A\t12.3
-A\t11.9
-B\t13.0
-B\t12.8
-B\t13.2
-C\t11.6
-C\t11.8
-C\t11.7
-"""
-
-TWA_SAMPLE = """Formulation\tCondition\tResponse
-A\t25C\t98.1
-A\t25C\t97.9
-A\t40C\t95.4
-A\t40C\t95.1
-B\t25C\t99.2
-B\t25C\t99.0
-B\t40C\t96.8
-B\t40C\t96.5
-C\t25C\t97.4
-C\t25C\t97.7
-C\t40C\t94.2
-C\t40C\t94.5
-"""
-
-TC_WIDE_SAMPLE = """Population_A\tPopulation_B
-98.1\t97.4
-97.9\t97.8
-98.4\t97.5
-98.0\t97.9
-98.3\t97.6
-97.7\t98.1
-98.5\t97.3
-"""
-
-TC_LONG_SAMPLE = """Group\tResponse
-A\t98.1
-A\t97.9
-A\t98.4
-A\t98.0
-A\t98.3
-B\t97.4
-B\t97.8
-B\t97.5
-B\t97.9
-B\t97.6
-"""
-
-PCA_SAMPLE = """Sample\tBatch\tVar1\tVar2\tVar3\tVar4\tVar5
-S1\tA\t10.2\t5.1\t101\t0.45\t8.2
-S2\tA\t10.5\t5.3\t99\t0.52\t8.0
-S3\tA\t9.9\t4.8\t102\t0.49\t8.4
-S4\tB\t12.1\t6.1\t110\t0.72\t7.1
-S5\tB\t11.8\t5.9\t108\t0.68\t7.3
-S6\tB\t12.4\t6.3\t111\t0.75\t7.0
-S7\tC\t8.7\t4.2\t95\t0.31\t9.1
-S8\tC\t8.9\t4.4\t96\t0.34\t8.9
-S9\tC\t8.5\t4.1\t94\t0.29\t9.3
-"""
-
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="lm Stats Suite", page_icon="🔬", layout="wide")
-
-# --- MASTER NAVIGATION SIDEBAR ---
-st.sidebar.title("🔬 lm Stats")
-st.sidebar.markdown("Select a tool below:")
-
-app_selection = st.sidebar.radio("Navigation", [
-    "01 - Descriptive Statistics",
-    "02 - Shelf Life Estimator",
-    "03 - Dissolution Comparison (f2)",
-    "04 - Two-Sample Tests",
-    "05 - Two-Way ANOVA",
-    "06 - Tolerance & Confidence Intervals",
-    "07 - PCA Analysis"
-])
-
-st.sidebar.divider()
-st.sidebar.info("Upload or paste data directly from Excel into the tools.")
-
-# ==========================================
-# APP 01: DESCRIPTIVE STATISTICS
-# ==========================================
+    cov = np.cov(scores[:, 0], scores[:, 1])
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = eigvals.argsort()[::-1]
+    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
+    angle = np.degrees(np.arctan2(*eigvecs[:, 0][::-1]))
+    width, height = 2 * np.sqrt(5.991 * eigvals)
+    ell = Ellipse(scores.mean(axis=0), width, height, angle=angle, fill=False, lw=2, edgecolor=edgecolor)
+    ax.add_patch(ell)
+
+
+def doe_formula(safe_factors, model_type="interaction"):
+    terms = list(safe_factors)
+    if model_type in ["interaction", "quadratic"]:
+        for i in range(len(safe_factors)):
+            for j in range(i + 1, len(safe_factors)):
+                terms.append(f"{safe_factors[i]}:{safe_factors[j]}")
+    if model_type == "quadratic":
+        for f in safe_factors:
+            terms.append(f"I({f}**2)")
+    return "Response ~ " + " + ".join(terms)
+
+
+# -------------------------------------------------
+# App 01 Descriptive Statistics
+# -------------------------------------------------
 if app_selection == "01 - Descriptive Statistics":
+    app_header("📊 App 01 - Descriptive Statistics", "Paste one or more numeric columns with headers. For one column, get a graphical summary. For multiple columns, choose a reference and a test column to compare.")
 
-    @st.cache_data
-    def parse_pasted_data(text):
-        if not text.strip():
-            return None
-        parsers = [
-            lambda s: pd.read_csv(StringIO(s), sep="\t", engine="python"),
-            lambda s: pd.read_csv(StringIO(s), sep=",", engine="python"),
-            lambda s: pd.read_csv(StringIO(s), sep=";", engine="python"),
-        ]
-        for parser in parsers:
+    data_input = st.text_area("Data (paste with headers)", height=220)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="desc_dec")
+    alpha = st.slider("Significance level α", 0.001, 0.100, 0.050, 0.001, key="desc_alpha")
+    mean_ci_conf = st.slider("Mean CI confidence (%)", 80, 99, 95, 1, key="desc_mean_ci")
+    tol_cov = st.slider("Tolerance interval coverage (%)", 80, 99, 99, 1, key="desc_tol_cov")
+    tol_conf = st.slider("Tolerance interval confidence (%)", 80, 99, 95, 1, key="desc_tol_conf")
+
+    def _one_sample_summary(arr, label, ci_conf=0.95, tol_p=0.99, tol_confidence=0.95):
+        arr = np.asarray(arr, dtype=float)
+        n = len(arr)
+        mean = np.mean(arr)
+        sd = np.std(arr, ddof=1) if n > 1 else np.nan
+        se = sd / np.sqrt(n) if n > 1 else np.nan
+        tcrit = t.ppf(1 - (1 - ci_conf) / 2, n - 1) if n > 1 else np.nan
+        ci_half = tcrit * se if n > 1 else np.nan
+        _, tol_lower, tol_upper = tolerance_interval_normal(arr, p=tol_p, conf=tol_confidence, two_sided=True)
+        ad_stat, ad_p = normal_ad(arr) if n >= 8 else (np.nan, np.nan)
+        try:
+            sh_stat, sh_p = stats.shapiro(arr) if 3 <= n <= 5000 else (np.nan, np.nan)
+        except Exception:
+            sh_stat, sh_p = (np.nan, np.nan)
+        q1, med, q3 = np.percentile(arr, [25, 50, 75])
+        iqr = q3 - q1
+        lower_fence = q1 - 1.5 * iqr
+        upper_fence = q3 + 1.5 * iqr
+        whisker_lower = np.min(arr[arr >= lower_fence]) if np.any(arr >= lower_fence) else np.min(arr)
+        whisker_upper = np.max(arr[arr <= upper_fence]) if np.any(arr <= upper_fence) else np.max(arr)
+        return {
+            "label": label,
+            "n": n,
+            "sum": np.sum(arr),
+            "mean": mean,
+            "sd": sd,
+            "var": np.var(arr, ddof=1) if n > 1 else np.nan,
+            "min": np.min(arr),
+            "q1": q1,
+            "median": med,
+            "q3": q3,
+            "max": np.max(arr),
+            "whisker_lower": whisker_lower,
+            "whisker_upper": whisker_upper,
+            "ci_half": ci_half,
+            "ci_lower": mean - ci_half if pd.notna(ci_half) else np.nan,
+            "ci_upper": mean + ci_half if pd.notna(ci_half) else np.nan,
+            "tol_lower": tol_lower,
+            "tol_upper": tol_upper,
+            "ad_stat": ad_stat,
+            "ad_p": ad_p,
+            "shapiro_stat": sh_stat,
+            "shapiro_p": sh_p,
+        }
+
+    def _f_test_equal_var(a, b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        v1 = np.var(a, ddof=1)
+        v2 = np.var(b, ddof=1)
+        if np.isnan(v1) or np.isnan(v2) or v1 == 0 or v2 == 0:
+            return np.nan, np.nan
+        if v1 >= v2:
+            fstat = v1 / v2
+            dfn, dfd = len(a) - 1, len(b) - 1
+        else:
+            fstat = v2 / v1
+            dfn, dfd = len(b) - 1, len(a) - 1
+        p = 2 * min(stats.f.cdf(fstat, dfn, dfd), 1 - stats.f.cdf(fstat, dfn, dfd))
+        return fstat, min(p, 1.0)
+
+    def _anova_two_groups(a, b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        n1, n2 = len(a), len(b)
+        allv = np.concatenate([a, b])
+        grand = np.mean(allv)
+        m1, m2 = np.mean(a), np.mean(b)
+        ss_between = n1 * (m1 - grand) ** 2 + n2 * (m2 - grand) ** 2
+        ss_within = np.sum((a - m1) ** 2) + np.sum((b - m2) ** 2)
+        ss_total = np.sum((allv - grand) ** 2)
+        df_between = 1
+        df_within = n1 + n2 - 2
+        df_total = n1 + n2 - 1
+        ms_between = ss_between / df_between
+        ms_within = ss_within / df_within if df_within > 0 else np.nan
+        f_stat = ms_between / ms_within if ms_within and ms_within > 0 else np.nan
+        p = 1 - stats.f.cdf(f_stat, df_between, df_within) if pd.notna(f_stat) else np.nan
+        return pd.DataFrame({
+            "Source of Variation": ["Between Groups", "Within Groups", "Total"],
+            "SS": [ss_between, ss_within, ss_total],
+            "df": [df_between, df_within, df_total],
+            "MS": [ms_between, ms_within, np.nan],
+            "F": [f_stat, np.nan, np.nan],
+            "P-Value": [p, np.nan, np.nan],
+        }), ms_within, ss_between, ss_total
+
+    def _acceptance_band(ref, test, alpha_level=0.05):
+        ref = np.asarray(ref, dtype=float)
+        test = np.asarray(test, dtype=float)
+        n1, n2 = len(ref), len(test)
+        m1 = np.mean(ref)
+        v1 = np.var(ref, ddof=1)
+        v2 = np.var(test, ddof=1)
+        sp2 = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+        se_diff = np.sqrt((1 / n1 + 1 / n2) * sp2)
+        tcrit = t.ppf(1 - alpha_level / 2, n1 + n2 - 2)
+        return m1 - tcrit * se_diff, m1 + tcrit * se_diff
+
+    def _graphical_summary_figure(stats_list, title, shaded_range=None, shaded_label=None):
+        colors = ["#d62728", "#111111"] if len(stats_list) > 1 else [PRIMARY_COLOR]
+        labels = [s["label"] for s in stats_list]
+
+        mins = []
+        maxs = []
+        for s in stats_list:
+            for key in ["min", "whisker_lower", "q1", "mean", "tol_lower", "ci_lower"]:
+                if pd.notna(s.get(key, np.nan)):
+                    mins.append(s[key])
+            for key in ["max", "whisker_upper", "q3", "mean", "tol_upper", "ci_upper"]:
+                if pd.notna(s.get(key, np.nan)):
+                    maxs.append(s[key])
+
+        sr = None
+        if shaded_range is not None:
             try:
-                df = parser(text)
-                if df.shape[1] >= 1:
-                    df.columns = [str(c).strip() for c in df.columns]
-                    for col in df.columns:
-                        if df[col].dtype == object:
-                            df[col] = df[col].astype(str).str.strip()
-                    return df.dropna(how="all").reset_index(drop=True)
+                sr = np.asarray(shaded_range, dtype=float).ravel()
+                if sr.size == 2 and np.all(np.isfinite(sr)):
+                    mins.append(float(np.min(sr)))
+                    maxs.append(float(np.max(sr)))
+                else:
+                    sr = None
             except Exception:
-                continue
-        return None
+                sr = None
 
-    def get_numeric_columns(df):
-        num_cols = []
-        for col in df.columns:
-            converted = pd.to_numeric(df[col].astype(str).str.replace("%", ""), errors="coerce")
-            if converted.notna().mean() >= 0.7:
-                num_cols.append(col)
-        return num_cols
+        x_min = min(mins) if mins else 0.0
+        x_max = max(maxs) if maxs else 1.0
+        pad = 0.08 * (x_max - x_min if x_max > x_min else 1)
+        x_lo, x_hi = x_min - pad, x_max + pad
 
-    st.title("📊 App 01 - Descriptive Statistics")
-    st.markdown("Paste data from Excel, optionally select grouping columns, and get summary statistics.")
+        fig, (ax, axr) = plt.subplots(1, 2, figsize=(max(FIG_W * 1.95, 13), max(FIG_H * 1.55, 7.5)), gridspec_kw={"width_ratios": [1.6, 1]})
 
-    data_input = st.text_area("Data (Paste with headers from Excel)", height=200)
+        density_y0 = 6.0
+        row_centers = [5.15, 4.30, 3.45, 2.60, 1.75, 0.90]
+        row_names = [
+            "Whisker Min/Max",
+            "Min/Max",
+            "Mean ± 3SD",
+            "IQR (Q1, Q3)",
+            f"{tol_cov}%/{tol_conf}% Tol. Interval",
+            f"{mean_ci_conf}% CI for Mean",
+        ]
+
+        if sr is not None:
+            ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
+            ax.axvline(sr[0], color="#ef4444", ls=":", lw=1.2)
+            ax.axvline(sr[1], color="#ef4444", ls=":", lw=1.2)
+            if shaded_label:
+                ax.text(float(np.mean(sr)), 6.25, shaded_label, color="#b91c1c", ha="center", va="bottom", fontsize=9, bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2))
+
+        xgrid = np.linspace(x_lo, x_hi, 500)
+        for i, s in enumerate(stats_list):
+            arr = s["raw"]
+            col = colors[i]
+            if len(np.unique(arr)) > 1 and len(arr) >= 3:
+                try:
+                    dens = gaussian_kde(arr)(xgrid)
+                    dens = dens / dens.max() * 0.85
+                except Exception:
+                    dens = np.zeros_like(xgrid)
+            else:
+                dens = np.zeros_like(xgrid)
+            ax.plot(xgrid, density_y0 + dens, color=col, lw=2)
+            ax.hlines(density_y0, x_lo, x_hi, color="#111827", lw=0.8)
+
+        offsets = [0.10, -0.10] if len(stats_list) > 1 else [0.0]
+        for ridx, yc in enumerate(row_centers):
+            ax.hlines(yc - 0.37, x_lo, x_hi, color="#d1d5db", lw=0.8)
+            for i, s in enumerate(stats_list):
+                yy = yc + offsets[i]
+                col = colors[i]
+                if ridx == 0:
+                    ax.hlines(yy, s["whisker_lower"], s["whisker_upper"], color=col, lw=1.8)
+                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                elif ridx == 1:
+                    ax.hlines(yy, s["min"], s["max"], color=col, lw=1.6)
+                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                elif ridx == 2:
+                    lo = s["mean"] - 3 * s["sd"] if pd.notna(s["sd"]) else np.nan
+                    hi = s["mean"] + 3 * s["sd"] if pd.notna(s["sd"]) else np.nan
+                    if pd.notna(lo) and pd.notna(hi):
+                        ax.hlines(yy, lo, hi, color=col, lw=1.8)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                elif ridx == 3:
+                    ax.hlines(yy, s["q1"], s["q3"], color=col, lw=2.0)
+                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                elif ridx == 4:
+                    ax.hlines(yy, s["tol_lower"], s["tol_upper"], color=col, lw=1.9)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                elif ridx == 5:
+                    ax.hlines(yy, s["ci_lower"], s["ci_upper"], color=col, lw=1.9)
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(0.4, 6.6)
+        ax.set_yticks([density_y0] + row_centers)
+        ax.set_yticklabels(["Normal distribution"] + row_names)
+        ax.set_title(title)
+        ax.grid(axis="x", alpha=GRID_ALPHA)
+        if SHOW_LEGEND:
+            handles = [plt.Line2D([0], [0], color=colors[i], marker='o', lw=2, label=labels[i]) for i in range(len(labels))]
+            ax.legend(handles=handles, frameon=False, loc=LEGEND_LOC)
+
+        axr.axis("off")
+        axr.set_title("Graphical Summary with Descriptive Statistics", fontsize=11, fontweight="bold", pad=10)
+        if len(stats_list) == 1:
+            s = stats_list[0]
+            rows = [
+                ("Normality (AD), p-value", fmt_p(s["ad_p"])),
+                ("Normality (Shapiro), p-value", fmt_p(s["shapiro_p"])),
+                ("Mean", s["mean"]),
+                ("SD", s["sd"]),
+                ("N", s["n"]),
+                ("Variance", s["var"]),
+                ("Minimum", s["min"]),
+                ("1st Quartile", s["q1"]),
+                ("Median", s["median"]),
+                ("3rd Quartile", s["q3"]),
+                ("Maximum", s["max"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s["tol_lower"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s["tol_upper"]),
+                (f"{mean_ci_conf}% LCI for Mean", s["ci_lower"]),
+                (f"{mean_ci_conf}% UCI for Mean", s["ci_upper"]),
+            ]
+            axr.text(0.60, 0.96, s["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            y = 0.90
+            for name, val in rows:
+                axr.text(0.03, y, name, ha="left", va="center", fontsize=9, fontweight="bold")
+                if isinstance(val, str):
+                    show = val
+                else:
+                    show = "-" if pd.isna(val) else f"{val:.3f}"
+                axr.text(0.83, y, show, ha="center", va="center", fontsize=9)
+                y -= 0.055
+        else:
+            s1, s2 = stats_list[0], stats_list[1]
+            rows = [
+                ("Normality (AD), p-value", fmt_p(s1["ad_p"]), fmt_p(s2["ad_p"])),
+                ("Mean", s1["mean"], s2["mean"]),
+                ("SD", s1["sd"], s2["sd"]),
+                ("N", s1["n"], s2["n"]),
+                ("Variance", s1["var"], s2["var"]),
+                ("Minimum", s1["min"], s2["min"]),
+                ("1st Quartile", s1["q1"], s2["q1"]),
+                ("Median", s1["median"], s2["median"]),
+                ("3rd Quartile", s1["q3"], s2["q3"]),
+                ("Maximum", s1["max"], s2["max"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s1["tol_lower"], s2["tol_lower"]),
+                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s1["tol_upper"], s2["tol_upper"]),
+                (f"{mean_ci_conf}% LCI for Mean", s1["ci_lower"], s2["ci_lower"]),
+                (f"{mean_ci_conf}% UCI for Mean", s1["ci_upper"], s2["ci_upper"]),
+            ]
+            axr.text(0.62, 0.96, s1["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            axr.text(0.90, 0.96, s2["label"], ha="center", va="top", fontsize=10, fontweight="bold")
+            y = 0.90
+            for name, v1, v2 in rows:
+                axr.text(0.02, y, name, ha="left", va="center", fontsize=8.8, fontweight="bold")
+                show1 = v1 if isinstance(v1, str) else ("-" if pd.isna(v1) else f"{v1:.3f}")
+                show2 = v2 if isinstance(v2, str) else ("-" if pd.isna(v2) else f"{v2:.3f}")
+                axr.text(0.62, y, show1, ha="center", va="center", fontsize=9)
+                axr.text(0.90, y, show2, ha="center", va="center", fontsize=9)
+                y -= 0.055
+
+        plt.tight_layout()
+        return fig
 
     if data_input:
-        df = parse_pasted_data(data_input)
-        if df is not None and not df.empty:
-            st.success(f"Loaded shape: {df.shape[0]} rows × {df.shape[1]} columns")
-            with st.expander("Preview Loaded Data"):
-                st.dataframe(df.head(10), use_container_width=True)
+        df = parse_pasted_table(data_input, header=True)
+        if df is None or df.empty:
+            st.error("Could not parse the pasted data.")
+        else:
+            st.success(f"Loaded {df.shape[0]} rows × {df.shape[1]} columns")
+            with st.expander("Preview data"):
+                st.dataframe(df, use_container_width=True)
 
             numeric_cols = get_numeric_columns(df)
-            all_cols = list(df.columns)
-
-            st.markdown("### Configuration")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                selected_vars = st.multiselect("Variables", options=numeric_cols, default=numeric_cols)
-            with col2:
-                group1 = st.selectbox("Group by 1", options=["(None)"] + all_cols)
-            with col3:
-                group2 = st.selectbox("Group by 2", options=["(None)"] + all_cols)
-
-            decimals = st.slider("Decimals", min_value=1, max_value=8, value=3)
-
-            if st.button("Run Descriptive Statistics", type="primary"):
-                if not selected_vars:
-                    st.error("Please select at least one numeric variable.")
+            if len(numeric_cols) == 0:
+                st.error("No numeric columns were detected.")
+            else:
+                is_single = len(numeric_cols) == 1
+                if is_single:
+                    ref_col = numeric_cols[0]
+                    test_col = None
+                    st.info(f"Single numeric column detected: {ref_col}")
                 else:
-                    for v in selected_vars:
-                        df[v] = pd.to_numeric(df[v].astype(str).str.replace("%", ""), errors="coerce")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        ref_col = st.selectbox("Reference column", numeric_cols, index=0)
+                    with c2:
+                        test_candidates = [c for c in numeric_cols if c != ref_col]
+                        test_col = st.selectbox("Test column", test_candidates, index=0)
 
-                    active_groups = [g for g in [group1, group2] if g != "(None)"]
+                if st.button("Run descriptive statistics", type="primary"):
+                    ref = to_numeric(df[ref_col]).dropna().to_numpy()
+                    if len(ref) < 3:
+                        st.error("Reference column must contain at least 3 numeric values.")
+                    else:
+                        ref_stats = _one_sample_summary(ref, ref_col, ci_conf=mean_ci_conf / 100, tol_p=tol_cov / 100, tol_confidence=tol_conf / 100)
+                        ref_stats["raw"] = ref
 
-                    def calc_stats(x):
-                        return pd.Series({
-                            "N": x.count(),
-                            "Mean": x.mean(),
-                            "Std. Dev": x.std(ddof=1),
-                            "Min": x.min(),
-                            "Median": x.median(),
-                            "Max": x.max(),
-                            "CV (%)": (x.std(ddof=1) / x.mean() * 100) if x.mean() != 0 else np.nan
+                        tables = {}
+                        figs = {}
+
+                        summary_tbl = pd.DataFrame({
+                            "Groups": [ref_col],
+                            "Count": [ref_stats["n"]],
+                            "Sum": [ref_stats["sum"]],
+                            "Average": [ref_stats["mean"]],
+                            "StDev": [ref_stats["sd"]],
+                            f"{mean_ci_conf}% CI ±": [ref_stats["ci_half"]],
                         })
 
-                    st.markdown("### Results")
-                    try:
-                        if active_groups:
-                            results = df.groupby(active_groups)[selected_vars].apply(lambda g: g.apply(calc_stats)).unstack(level=-1)
-                            if len(selected_vars) == 1:
-                                results.columns = results.columns.droplevel(0)
-                        else:
-                            results = df[selected_vars].apply(calc_stats).T
-                        display_df(results.reset_index() if isinstance(results.index, pd.MultiIndex) else results, decimals)
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        else:
-            st.error("Could not parse data.")
+                        normality_tbl = pd.DataFrame([
+                            {"Test": "Anderson-Darling", "Group": ref_col, "Statistic": ref_stats["ad_stat"], "P-Value": ref_stats["ad_p"], "Comment": f"{'Normally distributed' if pd.notna(ref_stats['ad_p']) and ref_stats['ad_p'] >= alpha else 'Possible non-normality'} (p {'>=' if pd.notna(ref_stats['ad_p']) and ref_stats['ad_p'] >= alpha else '<'} {alpha:.3f})" if pd.notna(ref_stats['ad_p']) else "AD test not available"},
+                            {"Test": "Shapiro-Wilk", "Group": ref_col, "Statistic": ref_stats["shapiro_stat"], "P-Value": ref_stats["shapiro_p"], "Comment": f"{'Normally distributed' if pd.notna(ref_stats['shapiro_p']) and ref_stats['shapiro_p'] >= alpha else 'Possible non-normality'} (p {'>=' if pd.notna(ref_stats['shapiro_p']) and ref_stats['shapiro_p'] >= alpha else '<'} {alpha:.3f})" if pd.notna(ref_stats['shapiro_p']) else "Shapiro test not available"},
+                        ])
 
-# ==========================================
-# APP 02: SHELF LIFE ESTIMATOR
-# ==========================================
-elif app_selection == "02 - Shelf Life Estimator":
-    st.title("📈 App 02 - Shelf Life Estimator")
-    st.markdown("Paste **Time** and **Response** columns, set the specification, and estimate shelf life from fit/CI/PI crossing.")
+                        st.markdown("### Tables")
+                        report_table(summary_tbl, "Summary of Means", decimals)
+                        report_table(normality_tbl, "Normality Tests", decimals)
+                        tables["Summary of Means"] = summary_tbl
+                        tables["Normality Tests"] = normality_tbl
 
-    c1, c2 = st.columns([2, 1])
+                        fig = _graphical_summary_figure([ref_stats], f"Graphical Summary: {ref_col}")
+                        st.markdown("### Graphical Summary")
+                        st.pyplot(fig)
+                        figs["Graphical Summary"] = fig_to_png_bytes(fig)
+                        plt.close(fig)
+
+                        export_results(
+                            prefix="descriptive_statistics_single",
+                            report_title="Statistical Analysis Report",
+                            module_name="Descriptive Statistics",
+                            statistical_analysis="This one-sample descriptive analysis summarizes a single quantitative variable using count, sum, mean, standard deviation, quartiles, minimum and maximum. It also checks normality using Anderson-Darling and Shapiro-Wilk tests, computes a confidence interval for the mean, and calculates a normal-theory tolerance interval.",
+                            offer_text="It offers a compact graphical and tabular summary for a single population, helping you assess central tendency, spread, distribution shape, normality, confidence bounds for the mean, and an interval that is expected to cover a chosen proportion of the population.",
+                            python_tools="Python tools used in this analysis include pandas and numpy for data handling and descriptive calculations, scipy.stats and statsmodels for normality tests and interval calculations, matplotlib for the graphical summary, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                            table_map=tables,
+                            figure_map=figs,
+                            conclusion=f"The variable {ref_col} was summarized with descriptive statistics and normality checks. Review the graphical summary, the mean confidence interval, and the tolerance interval to judge both the center and the expected spread of the population.",
+                            decimals=decimals,
+                        )
+
+                        if not is_single and test_col is not None:
+                            test = to_numeric(df[test_col]).dropna().to_numpy()
+                            if len(test) < 3:
+                                st.error("Test column must contain at least 3 numeric values.")
+                            else:
+                                test_stats = _one_sample_summary(test, test_col, ci_conf=mean_ci_conf / 100, tol_p=tol_cov / 100, tol_confidence=tol_conf / 100)
+                                test_stats["raw"] = test
+
+                                summary_tbl = pd.DataFrame({
+                                    "Groups": [ref_col, test_col],
+                                    "Count": [ref_stats["n"], test_stats["n"]],
+                                    "Sum": [ref_stats["sum"], test_stats["sum"]],
+                                    "Average": [ref_stats["mean"], test_stats["mean"]],
+                                    "StDev": [ref_stats["sd"], test_stats["sd"]],
+                                    f"{mean_ci_conf}% CI ±": [ref_stats["ci_half"], test_stats["ci_half"]],
+                                })
+
+                                normality_tbl = pd.DataFrame([
+                                    {"Test": "Anderson-Darling", "Group": ref_col, "Statistic": ref_stats["ad_stat"], "P-Value": ref_stats["ad_p"], "Comment": "Normally distributed" if pd.notna(ref_stats["ad_p"]) and ref_stats["ad_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Anderson-Darling", "Group": test_col, "Statistic": test_stats["ad_stat"], "P-Value": test_stats["ad_p"], "Comment": "Normally distributed" if pd.notna(test_stats["ad_p"]) and test_stats["ad_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Shapiro-Wilk", "Group": ref_col, "Statistic": ref_stats["shapiro_stat"], "P-Value": ref_stats["shapiro_p"], "Comment": "Normally distributed" if pd.notna(ref_stats["shapiro_p"]) and ref_stats["shapiro_p"] >= alpha else "Possible non-normality"},
+                                    {"Test": "Shapiro-Wilk", "Group": test_col, "Statistic": test_stats["shapiro_stat"], "P-Value": test_stats["shapiro_p"], "Comment": "Normally distributed" if pd.notna(test_stats["shapiro_p"]) and test_stats["shapiro_p"] >= alpha else "Possible non-normality"},
+                                ])
+
+                                f_stat, f_p = _f_test_equal_var(ref, test)
+                                lev_stat, lev_p = stats.levene(ref, test, center="mean")
+                                eqvar_tbl = pd.DataFrame([
+                                    {"Test": "F Test", "Statistic": f_stat, "P-Value": f_p, "Comment": "Equal variances" if pd.notna(f_p) and f_p >= alpha else "Unequal variances"},
+                                    {"Test": "Levene's Test (mean)", "Statistic": lev_stat, "P-Value": lev_p, "Comment": "Equal variances" if lev_p >= alpha else "Unequal variances"},
+                                ])
+
+                                t_eq = stats.ttest_ind(ref, test, equal_var=True)
+                                t_welch = stats.ttest_ind(ref, test, equal_var=False)
+                                mw = stats.mannwhitneyu(ref, test, alternative="two-sided")
+                                comp_tbl = pd.DataFrame([
+                                    {"Test": "Student t-test", "Statistic": t_eq.statistic, "P-Value": t_eq.pvalue, "Comment": "Difference in means" if t_eq.pvalue < alpha else "No evidence of difference in means"},
+                                    {"Test": "Welch t-test", "Statistic": t_welch.statistic, "P-Value": t_welch.pvalue, "Comment": "Difference in means" if t_welch.pvalue < alpha else "No evidence of difference in means"},
+                                    {"Test": "Mann-Whitney U", "Statistic": mw.statistic, "P-Value": mw.pvalue, "Comment": "Difference in distributions" if mw.pvalue < alpha else "No evidence of distributional difference"},
+                                ])
+
+                                anova_tbl, mse, ss_between, ss_total = _anova_two_groups(ref, test)
+                                rsq = ss_between / ss_total if ss_total > 0 else np.nan
+                                rsq_adj = 1 - (1 - rsq) * ((len(ref) + len(test) - 1) / (len(ref) + len(test) - 2 - 0)) if (len(ref) + len(test) - 2) > 0 and pd.notna(rsq) else np.nan
+                                model_tbl = pd.DataFrame({"Pooled SD": [np.sqrt(mse)], "R²": [rsq], "R² (adj)": [rsq_adj]})
+
+                                shaded = _acceptance_band(ref, test, alpha_level=alpha)
+                                graph_tbl = pd.DataFrame({
+                                    "Reference": [ref_col],
+                                    "Reference Mean": [ref_stats["mean"]],
+                                    "Acceptance Lower": [shaded[0]],
+                                    "Acceptance Upper": [shaded[1]],
+                                    "Test Mean": [test_stats["mean"]],
+                                })
+
+                                st.markdown("### Comparison Tables")
+                                report_table(summary_tbl, "Summary of Means", decimals)
+                                report_table(normality_tbl, "Normality Tests", decimals)
+                                report_table(eqvar_tbl, "Equal Variances Test", decimals)
+                                report_table(anova_tbl, "ANOVA", decimals)
+                                report_table(model_tbl, "Model Summary (ANOVA)", decimals)
+                                report_table(comp_tbl, "Mean / Distribution Comparison", decimals)
+
+                                tables = {
+                                    "Summary of Means": summary_tbl,
+                                    "Normality Tests": normality_tbl,
+                                    "Equal Variances Test": eqvar_tbl,
+                                    "ANOVA": anova_tbl,
+                                    "Model Summary (ANOVA)": model_tbl,
+                                    "Mean / Distribution Comparison": comp_tbl,
+                                    "Acceptance Range": graph_tbl,
+                                }
+
+                                shade_label = f"p > {alpha:.3f} zone around {ref_col} mean"
+                                fig = _graphical_summary_figure([ref_stats, test_stats], f"Graphical Summary: {ref_col} vs {test_col}", shaded_range=shaded, shaded_label=shade_label)
+                                st.markdown("### Graphical Summary")
+                                info_box(f"The shaded area is centered on the reference mean and spans the range in which the test mean would remain within the two-sided t-test acceptance zone at α = {alpha:.3f}, using the pooled within-group variance.")
+                                st.pyplot(fig)
+                                figs = {"Graphical Summary": fig_to_png_bytes(fig)}
+                                plt.close(fig)
+
+                                equal_var_msg = "equal variances" if lev_p >= alpha else "unequal variances"
+                                conclusion = (
+                                    f"{ref_col} was treated as the reference and {test_col} as the test population. "
+                                    f"The shaded region in the graph shows the approximate range around the reference mean that would keep the test mean non-significant at α = {alpha:.3f} under the pooled-variance t-test framework. "
+                                    f"The variance assessment suggested {equal_var_msg}. Review the Student/Welch and Mann-Whitney results together with the graphical summary before concluding whether the two populations differ in mean or broader distribution."
+                                )
+
+                                export_results(
+                                    prefix="descriptive_statistics_comparison",
+                                    report_title="Statistical Analysis Report",
+                                    module_name="Descriptive Statistics / Two-Group Comparison",
+                                    statistical_analysis="This analysis summarizes each selected population using descriptive statistics, normality tests, confidence intervals for the mean, and normal-theory tolerance intervals. When both a reference and a test column are selected, it also evaluates equality of variances and compares the two populations using Student's t-test, Welch's t-test, Mann-Whitney U, and a two-group ANOVA summary. The shaded band in the graphical summary is centered on the reference mean and represents the approximate region in which the test mean would remain non-significant at the chosen alpha level using the pooled within-group error term.",
+                                    offer_text="It offers a report-ready way to summarize one population or compare two populations for difference in means, variability, and overall distribution. It also shows whether the test mean stays within the practical acceptance region around the reference mean, which is useful when you want a quick visual link between mean separation and the p-value threshold.",
+                                    python_tools="Python tools used in this analysis include pandas and numpy for cleaning and calculations, scipy.stats for t-tests, Levene, Shapiro-Wilk, F distributions, and tolerance-related statistics, statsmodels for Anderson-Darling normality testing, matplotlib for the graphical summary, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                                    table_map=tables,
+                                    figure_map=figs,
+                                    conclusion=conclusion,
+                                    decimals=decimals,
+                                )
+
+
+
+# -------------------------------------------------
+# App 02 Regression Intervals
+# -------------------------------------------------
+elif app_selection == "02 - Regression Intervals":
+    app_header("📈 App 02 - Regression Intervals", "Linear regression with CI / PI / both, one-sided or two-sided bands, prediction points, and spec-limit crossing.")
+
+    left, right = st.columns([1.45, 1])
+    with left:
+        xy_input = st.text_area("Paste X and Y data (two Excel columns, with or without headers)", height=220)
+    with right:
+        x_pred_text = st.text_area("Predict X (optional)", height=110, placeholder="Paste X values to predict")
+
+    if xy_input:
+        try:
+            data_df, x_label_detected, y_label_detected = parse_xy(xy_input)
+
+            st.markdown("### Options")
+            c1, c2, c3 = st.columns([1, 1, 1.2])
+            with c1:
+                interval_mode = st.selectbox("Interval", ["ci", "pi", "both"], format_func=lambda x: {"ci":"CI", "pi":"PI", "both":"Both"}[x])
+            with c2:
+                side_mode = st.selectbox("Side", ["upper", "lower", "two-sided"], format_func=lambda x: {"upper":"Upper", "lower":"Lower", "two-sided":"Two-sided"}[x])
+            with c3:
+                confidence = st.slider("Confidence", 0.80, 0.99, 0.95, 0.01, format="%.2f")
+
+            c4, c5, c6, c7 = st.columns([1.2, 1.1, 1.1, 0.9])
+            with c4:
+                plot_title = st.text_input("Title", value="")
+            with c5:
+                xlabel = st.text_input("X label", value=x_label_detected or "X")
+            with c6:
+                ylabel = st.text_input("Y label", value=y_label_detected or "Y")
+            with c7:
+                point_label = st.text_input("Point label", value="Data")
+
+            c8, c9, c10, c11 = st.columns([0.9, 0.9, 0.9, 0.9])
+            with c8:
+                y_suffix = st.text_input("Y suffix", value="%")
+            with c9:
+                x_min_txt = st.text_input("X min", value="")
+            with c10:
+                default_xmax = str(max(40.0, float(max(data_df["x"].max(), reg_parse_prediction_points(x_pred_text).max()) if len(reg_parse_prediction_points(x_pred_text)) else float(data_df["x"].max()) * 1.15)))
+                x_max_txt = st.text_input("X max", value=default_xmax)
+            with c11:
+                decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="reg_dec_refined")
+
+            st.markdown("### Specification / crossing")
+            s1, s2, s3, s4 = st.columns([0.9, 1, 1, 1.2])
+            with s1:
+                spec_enabled = st.checkbox("Use spec limit", value=True)
+            with s2:
+                spec_value_txt = st.text_input("Spec value", value="3.0", disabled=not spec_enabled)
+            with s3:
+                spec_label = st.text_input("Spec label", value="US", disabled=not spec_enabled)
+            with s4:
+                crossing_on = st.selectbox(
+                    "Crossing on",
+                    ["auto", "fit", "ci_upper", "ci_lower", "pi_upper", "pi_lower"],
+                    format_func=lambda x: {
+                        "auto": "Auto", "fit": "Fit", "ci_upper": "CI upper", "ci_lower": "CI lower", "pi_upper": "PI upper", "pi_lower": "PI lower"
+                    }[x],
+                    disabled=not spec_enabled,
+                )
+
+            if st.button("Run regression analysis", type="primary"):
+                pred_x = reg_parse_prediction_points(x_pred_text)
+                x_all_max = data_df["x"].max()
+                if len(pred_x) > 0:
+                    x_all_max = max(x_all_max, np.max(pred_x))
+
+                def parse_optional_float(txt):
+                    txt = str(txt).strip()
+                    return None if txt == "" else float(txt)
+
+                x_min = parse_optional_float(x_min_txt)
+                x_max = parse_optional_float(x_max_txt)
+                if x_min is None:
+                    x_min = min(0.0, float(data_df["x"].min()))
+                if x_max is None:
+                    x_max = x_all_max * 1.15 if x_all_max != 0 else 1.0
+                if x_max <= x_min:
+                    raise ValueError("X max must be greater than X min.")
+
+                grid_x = np.linspace(x_min, x_max, 500)
+                model = reg_fit_linear_model(data_df["x"], data_df["y"])
+                grid_df = reg_predict_with_intervals(model, grid_x, confidence=confidence, side=side_mode)
+
+                fig_main, crossing_x = plot_regression_advanced(
+                    data_df=data_df,
+                    model=model,
+                    grid_df=grid_df,
+                    confidence=confidence,
+                    interval=interval_mode,
+                    side=side_mode,
+                    title=plot_title,
+                    xlabel=xlabel,
+                    ylabel=ylabel,
+                    point_label=point_label,
+                    y_suffix=y_suffix,
+                    spec_enabled=spec_enabled,
+                    spec_limit=parse_optional_float(spec_value_txt) if spec_enabled else None,
+                    spec_label=spec_label,
+                    crossing_on=crossing_on,
+                )
+                st.pyplot(fig_main)
+
+                summary_tbl = pd.DataFrame({
+                    "Intercept": [model["intercept"]],
+                    "Slope": [model["slope"]],
+                    "R²": [model["r2"]],
+                    "Residual SD (s)": [model["s"]],
+                    "Degrees of Freedom": [model["df"]],
+                })
+                if crossing_x is not None:
+                    summary_tbl["Crossing Point"] = [crossing_x]
+                report_table(summary_tbl, "Regression model summary", decimals)
+
+                report_table(data_df.rename(columns={"x": "X Value", "y": "Actual Y"}), "Table 1: Parsed input data", decimals)
+
+                new_pred_x = np.setdiff1d(pred_x, data_df["x"].to_numpy()) if len(pred_x) > 0 else np.array([])
+                if len(new_pred_x) > 0:
+                    new_pts_df = pd.DataFrame({"x": new_pred_x, "y": np.nan})
+                    combined_pts_df = pd.concat([data_df[["x", "y"]], new_pts_df], ignore_index=True)
+                else:
+                    combined_pts_df = data_df[["x", "y"]].copy()
+                combined_pts_df = combined_pts_df.sort_values("x").reset_index(drop=True)
+                unique_x = combined_pts_df["x"].unique()
+                intervals_df = reg_predict_with_intervals(model, unique_x, confidence=confidence, side=side_mode)
+                final_table_df = pd.merge(combined_pts_df, intervals_df, on="x", how="left")
+                final_table_df = final_table_df[[c for c in ["x", "y", "fit", "ci_lower", "ci_upper", "pi_lower", "pi_upper"] if c in final_table_df.columns]]
+                final_table_df.columns = ["X Value", "Actual Y", "Fitted Y", "Lower CI", "Upper CI", "Lower PI", "Upper PI"]
+                report_table(final_table_df, "Table 2: Fitted values and intervals", decimals)
+
+                fig_res = residual_plot(model["fitted"], model["resid"], xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+                st.pyplot(fig_res)
+                fig_qq = qq_plot(model["resid"], title="Normal probability plot of regression residuals")
+                st.pyplot(fig_qq)
+
+                crossing_text = f" A crossing with the selected specification limit was identified at x = {crossing_x:.{decimals}f}." if crossing_x is not None else " No crossing with the selected specification limit was identified in the displayed X range."
+                conclusion = (
+                    f"A simple linear regression was fitted to {len(data_df)} observations. "
+                    f"The fitted equation was y = {model['intercept']:.{decimals}f} + {model['slope']:.{decimals}f} × x, "
+                    f"with R² = {model['r2']:.{decimals}f} and residual SD = {model['s']:.{decimals}f}. "
+                    f"The analysis displayed {('confidence intervals' if interval_mode == 'ci' else 'prediction intervals' if interval_mode == 'pi' else 'both confidence and prediction intervals')} using a {side_mode} setting at {confidence:.0%} confidence." + crossing_text
+                )
+                export_results(
+                    prefix="regression_intervals_refined",
+                    report_title="Statistical Analysis Report",
+                    module_name="Regression Intervals",
+                    statistical_analysis=(
+                        "A simple linear regression model was fitted to the pasted X and Y data using ordinary least squares. "
+                        "The analysis estimates the intercept and slope of the linear relationship, summarizes goodness of fit using R² and residual standard deviation, "
+                        "and then calculates confidence intervals for the fitted mean response and prediction intervals for future observations. "
+                        "The module also allows one-sided or two-sided interval construction and can estimate a crossing point against a user-defined specification limit."
+                    ),
+                    offer_text=(
+                        "This analysis offers a practical way to evaluate linear trends over X, quantify the expected response at user-selected X values, "
+                        "compare observed responses with fitted values, and distinguish between uncertainty in the average response and variability expected for individual future measurements. "
+                        "When a specification limit is supplied, it can also estimate where the fitted curve or selected interval band crosses that limit."
+                    ),
+                    python_tools=(
+                        "Python tools used here include pandas for parsing pasted Excel-style data, numpy for matrix algebra and grid generation, "
+                        "scipy.stats for t-based interval calculations, matplotlib for the fitted-curve, residual, and normal probability plots, "
+                        "openpyxl for Excel export, and reportlab for the PDF-style report."
+                    ),
+                    table_map={
+                        "Regression Model Summary": summary_tbl,
+                        "Parsed Input Data": data_df.rename(columns={"x": "X Value", "y": "Actual Y"}),
+                        "Fitted Values and Intervals": final_table_df,
+                    },
+                    figure_map={
+                        "Regression plot": fig_to_png_bytes(fig_main),
+                        "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                        "Normal probability plot": fig_to_png_bytes(fig_qq),
+                    },
+                    conclusion=conclusion,
+                    decimals=decimals,
+                )
+        except Exception as e:
+            st.error(str(e))
+
+
+# App 03 Shelf Life Estimator
+# -------------------------------------------------
+elif app_selection == "03 - Shelf Life Estimator":
+    app_header("⏳ App 03 - Shelf Life Estimator", "Paste stability data, choose lower or upper specification, and estimate shelf life from fit, CI, or PI crossing.")
+
+    def sl_predict_local(model, x_values, confidence=0.95, one_sided=True):
+        x_values = np.asarray(x_values, dtype=float).ravel()
+        Xg = np.column_stack([np.ones(len(x_values)), x_values])
+        beta = np.array([model["intercept"], model["slope"]])
+        fit = Xg @ beta
+        h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
+        se_mean = model["s"] * np.sqrt(h)
+        se_pred = model["s"] * np.sqrt(1 + h)
+        alpha = 1 - confidence
+        tcrit = t.ppf(confidence, model["df"]) if one_sided else t.ppf(1 - alpha / 2, model["df"])
+        return pd.DataFrame({
+            "x": x_values,
+            "fit": fit,
+            "ci_lower": fit - tcrit * se_mean,
+            "ci_upper": fit + tcrit * se_mean,
+            "pi_lower": fit - tcrit * se_pred,
+            "pi_upper": fit + tcrit * se_pred,
+        })
+
+    def sl_find_crossing_local(xv, yv, limit):
+        xv = np.asarray(xv, dtype=float)
+        yv = np.asarray(yv, dtype=float)
+        d = yv - limit
+        if len(d) == 0:
+            return None
+        if d[0] == 0:
+            return float(xv[0])
+        for i in range(len(d) - 1):
+            if d[i] == 0:
+                return float(xv[i])
+            if d[i] * d[i + 1] < 0:
+                x1, x2 = xv[i], xv[i + 1]
+                y1, y2 = yv[i], yv[i + 1]
+                if y2 == y1:
+                    return float(x1)
+                return float(x1 + (limit - y1) * (x2 - x1) / (y2 - y1))
+        return None
+
+    def sl_get_bound_column_local(spec_side, shelf_basis):
+        if shelf_basis == "fit":
+            return "fit"
+        if shelf_basis == "ci":
+            return "ci_lower" if spec_side == "lower" else "ci_upper"
+        if shelf_basis == "pi":
+            return "pi_lower" if spec_side == "lower" else "pi_upper"
+        raise ValueError("Invalid shelf-life basis.")
+
+    def sl_plot_local(data_df, grid_df, spec_side, spec_limit, shelf_basis, show_ci_band, show_pi_band,
+                      title, xlabel, ylabel, point_label, y_suffix, spec_label):
+        x = data_df["x"].to_numpy()
+        y = data_df["y"].to_numpy()
+        fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+
+        if show_pi_band:
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.10, label="PI band")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, lw=1.0, ls=(0, (4, 4)))
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, lw=1.0, ls=(0, (4, 4)))
+
+        if show_ci_band:
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.15, label="CI band")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, lw=1.0, ls="--")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, lw=1.0, ls="--")
+
+        ax.scatter(x, y, color=PRIMARY_COLOR, s=50, alpha=0.85, label=point_label, zorder=3)
+        ax.plot(grid_df["x"], grid_df["fit"], color="#2c3e50", lw=2, label="Fitted line")
+
+        bound_col = sl_get_bound_column_local(spec_side, shelf_basis)
+        bound_color = {"fit": "#2c3e50", "ci": BAND_COLOR, "pi": SECONDARY_COLOR}[shelf_basis]
+        bound_label = {
+            "fit": "Shelf-life line (fit)",
+            "ci": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} CI)",
+            "pi": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} PI)",
+        }[shelf_basis]
+        if shelf_basis != "fit":
+            ax.plot(grid_df["x"], grid_df[bound_col], color=bound_color, lw=2.5, label=bound_label)
+
+        ax.axhline(spec_limit, color="#27ae60", ls="--", lw=1.5, label=f"Limit ({spec_label})")
+        shelf_life = sl_find_crossing_local(grid_df["x"].to_numpy(), grid_df[bound_col].to_numpy(), spec_limit)
+        if shelf_life is not None:
+            ax.axvline(shelf_life, color="#27ae60", ls=":", lw=1.5)
+
+        xmin = float(grid_df["x"].min())
+        xmax = float(grid_df["x"].max())
+        ymax_data = max(np.max(y), np.max(grid_df["fit"]), np.max(grid_df["ci_upper"]), np.max(grid_df["pi_upper"]))
+        ymin_data = min(np.min(y), np.min(grid_df["fit"]), np.min(grid_df["ci_lower"]), np.min(grid_df["pi_lower"]))
+        pad = 0.03 * ((ymax_data - ymin_data) if ymax_data > ymin_data else 1)
+
+        ax.text(
+            xmin + (xmax - xmin) * 0.02,
+            spec_limit + pad,
+            f"{spec_label} = {spec_limit:.2f}{y_suffix}",
+            ha="left", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+            bbox=dict(facecolor="white", alpha=0.82, edgecolor="none", pad=3),
+        )
+        if shelf_life is not None:
+            ax.text(
+                shelf_life,
+                ymin_data + pad,
+                f" {shelf_life:.2f} ",
+                ha="right", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+                bbox=dict(facecolor="white", alpha=0.82, edgecolor="none", pad=2),
+            )
+
+        if y_suffix:
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
+
+        if not str(title).strip():
+            side_txt = "Lower Spec" if spec_side == "lower" else "Upper Spec"
+            basis_txt = {"fit": "Fit", "ci": "Confidence Bound", "pi": "Prediction Bound"}[shelf_basis]
+            title = f"Shelf Life Estimator ({side_txt}, {basis_txt})"
+
+        apply_ax_style(ax, title, xlabel, ylabel, legend=True)
+        return fig, shelf_life, bound_col
+
+    c1, c2 = st.columns([1.35, 1])
     with c1:
-        data_input = st.text_area("Stability data (2 columns: Time and Response)", value=SHELF_SAMPLE_DATA, height=180)
+        xy_input = st.text_area("Paste Time and Response data (with or without headers)", height=220)
     with c2:
-        pred_input = st.text_area("Optional future X values", value=SHELF_SAMPLE_PRED, height=180)
+        pred_x_text = st.text_area("Predict future X values (optional)", value="30\n36\n48", height=120)
+        decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="sl_dec")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        spec_side = st.selectbox("Specification side", ["lower", "upper"], format_func=lambda x: "Lower spec" if x == "lower" else "Upper spec")
-    with c2:
-        shelf_basis = st.selectbox("Shelf life based on", ["ci", "pi", "fit"], format_func=lambda x: {"ci": "Confidence bound", "pi": "Prediction bound", "fit": "Fit line"}[x])
-    with c3:
-        confidence = st.slider("Confidence", 0.80, 0.99, 0.95, 0.01)
-    with c4:
-        spec_limit = st.number_input("Specification value", value=90.0, step=0.1)
+    r1c1, r1c2, r1c3 = st.columns([1, 1, 1.15])
+    with r1c1:
+        spec_side = st.selectbox("Spec side", ["lower", "upper"], format_func=lambda x: "Lower spec" if x == "lower" else "Upper spec")
+    with r1c2:
+        shelf_basis = st.selectbox("Shelf-life on", ["ci", "pi", "fit"], format_func=lambda x: {"ci": "Confidence bound", "pi": "Prediction bound", "fit": "Fit line"}[x])
+    with r1c3:
+        confidence = st.slider("Confidence", 0.80, 0.99, 0.95, 0.01, format="%.2f")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        spec_label = st.text_input("Specification label", value="Spec")
-    with c2:
-        xlabel = st.text_input("X label", value="Time")
-    with c3:
-        ylabel = st.text_input("Y label", value="Response")
-    with c4:
+    r2c1, r2c2, r2c3, r2c4 = st.columns([1, 1, 1, 1])
+    with r2c1:
+        spec_value_txt = st.text_input("Spec value", value="90")
+    with r2c2:
+        spec_label = st.text_input("Spec label", value="Spec")
+    with r2c3:
+        show_ci_band = st.checkbox("Show CI band", value=True)
+    with r2c4:
+        show_pi_band = st.checkbox("Show PI band", value=False)
+
+    plot_title = st.text_input("Title", value="")
+
+    r3c1, r3c2, r3c3, r3c4 = st.columns([1, 1, 1, 0.8])
+    with r3c1:
+        xlabel_override = st.text_input("X label", value="")
+    with r3c2:
+        ylabel_override = st.text_input("Y label", value="")
+    with r3c3:
+        point_label = st.text_input("Point label", value="Data")
+    with r3c4:
         y_suffix = st.text_input("Y suffix", value="%")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        point_label = st.text_input("Point label", value="Data")
-    with c2:
-        show_ci = st.checkbox("Show CI band", value=True)
-    with c3:
-        show_pi = st.checkbox("Show PI band", value=False)
-    with c4:
-        x_min_text = st.text_input("X min", value="")
-    with c5:
-        x_max_text = st.text_input("X max", value="")
+    r4c1, r4c2 = st.columns([1, 1])
+    with r4c1:
+        x_min_txt = st.text_input("X min", value="")
+    with r4c2:
+        x_max_txt = st.text_input("X max", value="")
 
-    plot_title = st.text_input("Plot title", value="")
-    decimals = st.slider("Decimals", 1, 8, 4)
-
-    if st.button("Run Shelf Life Analysis", type="primary"):
+    if xy_input:
         try:
-            data_df = sl_parse_xy_data(data_input)
-            pred_x = sl_parse_x_values(pred_input)
+            data_df, x_label_from_header, y_label_from_header = parse_xy(xy_input)
+            xlabel = xlabel_override.strip() or x_label_from_header or "Time"
+            ylabel = ylabel_override.strip() or y_label_from_header or "Response"
+            pred_x = parse_x_values(pred_x_text)
+            spec_limit = parse_optional_float(spec_value_txt)
+            if spec_limit is None:
+                raise ValueError("Enter a valid specification value.")
 
             x_data_max = float(data_df["x"].max())
             x_future_max = float(np.max(pred_x)) if len(pred_x) > 0 else x_data_max
-
-            x_min = safe_parse_float(x_min_text, default=min(0.0, float(data_df["x"].min())))
-            x_max = safe_parse_float(x_max_text, default=max(x_data_max * 3, x_future_max * 1.15, x_data_max + 12))
-
+            x_min = parse_optional_float(x_min_txt)
+            x_max = parse_optional_float(x_max_txt)
+            if x_min is None:
+                x_min = min(0.0, float(data_df["x"].min()))
+            if x_max is None:
+                x_max = max(x_data_max * 3, x_future_max * 1.15, x_data_max + 12)
             if x_max <= x_min:
                 raise ValueError("X max must be greater than X min.")
 
-            model = sl_fit_linear(data_df["x"], data_df["y"])
-            grid_x = np.linspace(x_min, x_max, 500)
-            grid_df = sl_predict(model, grid_x, confidence=confidence, one_sided=True)
-            pred_df = sl_predict(model, pred_x, confidence=confidence, one_sided=True) if len(pred_x) > 0 else pd.DataFrame()
+            model = fit_linear(data_df["x"], data_df["y"])
+            grid_x = np.linspace(x_min, x_max, 600)
+            grid_df = sl_predict_local(model, grid_x, confidence=confidence, one_sided=True)
 
-            bound_col = sl_get_bound_column(spec_side, shelf_basis)
-            shelf_life = sl_find_crossing(grid_df["x"].to_numpy(), grid_df[bound_col].to_numpy(), spec_limit)
-
-            summary_df = pd.DataFrame([{
-                "n": len(data_df),
-                "Intercept": model["intercept"],
-                "Slope": model["slope"],
-                "Residual_SD": model["s"],
-                "Degrees_of_freedom": model["df"],
-                "R_squared": model["r2"],
-                "Shelf_life_estimate": shelf_life
-            }])
-
-            st.markdown("### Model Summary")
-            display_df(summary_df, decimals)
-
-            if shelf_life is None:
-                st.warning("No crossing with the specification was found within the plotted X range.")
-            else:
-                st.success(f"Estimated shelf life: {shelf_life:.{decimals}f}")
-
-            if not pred_df.empty:
-                st.markdown("### Predictions at Requested X Values")
-                display_df(pred_df, decimals)
-
-            st.markdown("### Plot")
-            render_plot(
-                sl_plot,
+            fig_main, shelf_life, bound_col = sl_plot_local(
                 data_df=data_df,
                 grid_df=grid_df,
                 spec_side=spec_side,
                 spec_limit=spec_limit,
                 shelf_basis=shelf_basis,
-                show_ci_band=show_ci,
-                show_pi_band=show_pi,
-                title=plot_title or "Shelf Life Estimator",
+                show_ci_band=show_ci_band,
+                show_pi_band=show_pi_band,
+                title=plot_title,
                 xlabel=xlabel,
                 ylabel=ylabel,
                 point_label=point_label,
                 y_suffix=y_suffix,
-                spec_label=spec_label
+                spec_label=spec_label,
+            )
+            st.pyplot(fig_main)
+
+            summary_tbl = pd.DataFrame({
+                "Intercept": [model["intercept"]],
+                "Slope": [model["slope"]],
+                "R²": [model["r2"]],
+                "Residual SD (s)": [model["s"]],
+                "Degrees of Freedom": [model["df"]],
+                "Shelf-life basis": [bound_col],
+                "Confidence": [f"{confidence:.0%} one-sided"],
+                "Estimated Shelf Life": [np.nan if shelf_life is None else shelf_life],
+            })
+            report_table(summary_tbl, "Shelf-life estimation summary", decimals)
+            report_table(data_df.rename(columns={"x": x_label_from_header, "y": y_label_from_header}), "Table 1: Parsed data", decimals)
+
+            new_pred_x = np.setdiff1d(pred_x, data_df["x"].to_numpy()) if len(pred_x) > 0 else np.array([])
+            if len(new_pred_x) > 0:
+                new_pts_df = pd.DataFrame({"x": new_pred_x, "y": np.nan})
+                combined_pts_df = pd.concat([data_df[["x", "y"]], new_pts_df], ignore_index=True)
+            else:
+                combined_pts_df = data_df[["x", "y"]].copy()
+            combined_pts_df = combined_pts_df.sort_values("x").reset_index(drop=True)
+            unique_x = combined_pts_df["x"].unique()
+            intervals_df = sl_predict_local(model, unique_x, confidence=confidence, one_sided=True)
+            final_table_df = pd.merge(combined_pts_df, intervals_df, on="x", how="left")
+            final_table_df = final_table_df[[c for c in ["x", "y", "fit", "ci_lower", "ci_upper", "pi_lower", "pi_upper"] if c in final_table_df.columns]]
+            final_table_df.columns = [xlabel, f"Actual {ylabel}", f"Fitted {ylabel}", "Lower CI", "Upper CI", "Lower PI", "Upper PI"]
+            report_table(final_table_df, "Table 2: Fitted values and one-sided bounds", decimals)
+
+            fig_res = residual_plot(model["fitted"], model["resid"], xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+            st.pyplot(fig_res)
+            fig_qq = qq_plot(model["resid"], title="Normal probability plot of stability residuals")
+            st.pyplot(fig_qq)
+
+            conclusion = (
+                f"A linear regression was fitted to the stability data and one-sided bounds were calculated at {confidence:.0%} confidence. "
+                f"Shelf life was estimated using the {bound_col} crossing against the {spec_label} limit of {spec_limit:.{decimals}f}{y_suffix}. "
+                + (f"The estimated shelf life was {shelf_life:.{decimals}f}." if shelf_life is not None else "No crossing was found within the plotted range.")
+            )
+            export_results(
+                prefix="shelf_life_refined",
+                report_title="Statistical Analysis Report",
+                module_name="Shelf Life Estimator",
+                statistical_analysis=(
+                    "A simple linear regression model was fitted to the response-versus-time stability data using ordinary least squares. "
+                    "One-sided confidence and prediction bounds were then derived from the fitted model. Shelf life was estimated as the earliest time at which the selected basis "
+                    "(fit line, confidence bound, or prediction bound) crossed the chosen lower or upper specification limit."
+                ),
+                offer_text=(
+                    "This analysis offers a practical way to quantify the stability trend, visualize fitted performance and uncertainty, project future responses, and obtain a conservative shelf-life estimate based on either the fit, a confidence bound, or a prediction bound."
+                ),
+                python_tools=(
+                    "Python tools used here include pandas for parsing pasted Excel-style stability data, numpy for matrix calculations and prediction grids, scipy.stats for one-sided t-based bounds, matplotlib for the shelf-life, residual, and normal probability plots, openpyxl for Excel export, and reportlab for the PDF-style report."
+                ),
+                table_map={
+                    "Shelf-life Summary": summary_tbl,
+                    "Parsed Data": data_df.rename(columns={"x": x_label_from_header, "y": y_label_from_header}),
+                    "Fitted Values and One-Sided Bounds": final_table_df,
+                },
+                figure_map={
+                    "Shelf-life plot": fig_to_png_bytes(fig_main),
+                    "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                    "Normal probability plot": fig_to_png_bytes(fig_qq),
+                },
+                conclusion=conclusion,
+                decimals=decimals,
             )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(str(e))
 
-# ==========================================
-# APP 03: DISSOLUTION COMPARISON
-# ==========================================
-elif app_selection == "03 - Dissolution Comparison (f2)":
-    st.title("💊 App 03 - Dissolution Comparison (f2)")
-    st.markdown("Compare reference and test dissolution profiles with FDA-style point selection and optional bootstrap confidence intervals.")
-
+elif app_selection == "04 - Dissolution Comparison (f2)":
+    app_header("💊 App 04 - Dissolution Comparison (f2)", "Paste reference and test profiles and compare them with the similarity factor f₂.")
     c1, c2 = st.columns(2)
     with c1:
-        ref_input = st.text_area("Reference profile", value=DISS_REF_SAMPLE, height=220)
+        ref_text = st.text_area("Reference profile table", height=220)
     with c2:
-        test_input = st.text_area("Test profile", value=DISS_TEST_SAMPLE, height=220)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        include_zero = st.checkbox("Include time zero", value=False)
-    with c2:
-        cutoff_mode = st.selectbox("Point selection", ["apply_85", "all"], format_func=lambda x: "FDA-style: stop after first point where both ≥ threshold" if x == "apply_85" else "Use all common timepoints")
-    with c3:
-        threshold = st.number_input("Threshold", value=85.0, step=0.5)
-    with c4:
-        decimals = st.slider("Decimals", 1, 6, 2)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        bootstrap = st.checkbox("Bootstrap f2 CI", value=False)
-    with c2:
-        boot_method = st.selectbox("Bootstrap CI method", ["both", "percentile", "bca"])
-    with c3:
-        boot_conf = st.slider("Bootstrap confidence", 0.80, 0.99, 0.90, 0.01)
-    with c4:
-        boot_n = st.number_input("Resamples", min_value=100, value=2000, step=100)
-    with c5:
-        boot_seed = st.number_input("Seed", value=123, step=1)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        show_units = st.checkbox("Show unit traces", value=True)
-    with c2:
-        show_boot_plot = st.checkbox("Show bootstrap plot", value=True)
-    with c3:
-        ylabel = st.text_input("Y label", value="% Dissolved")
-    plot_title = st.text_input("Plot title", value="Dissolution Profiles")
-
-    if st.button("Run Dissolution Comparison", type="primary"):
+        test_text = st.text_area("Test profile table", height=220)
+    decimals = st.slider("Decimals", 1, 8, 2, key="f2_dec")
+    if ref_text and test_text:
         try:
-            ref_df = dis_parse_profile_table(ref_input)
-            test_df = dis_parse_profile_table(test_input)
+            ref = parse_pasted_table(ref_text, header=True)
+            test = parse_pasted_table(test_text, header=True)
+            ref.iloc[:, 0] = to_numeric(ref.iloc[:, 0])
+            test.iloc[:, 0] = to_numeric(test.iloc[:, 0])
+            ref = ref.dropna().reset_index(drop=True)
+            test = test.dropna().reset_index(drop=True)
+            if len(ref) == 0 or len(test) == 0 or not np.allclose(ref.iloc[:, 0], test.iloc[:, 0]):
+                raise ValueError("Reference and test must have matching time points in the first column.")
+            time_col = ref.columns[0]
+            time = to_numeric(ref.iloc[:, 0])
+            ref_vals = ref.iloc[:, 1:].apply(to_numeric)
+            test_vals = test.iloc[:, 1:].apply(to_numeric)
+            summary = pd.DataFrame({
+                time_col: time,
+                "Reference Mean": ref_vals.mean(axis=1),
+                "Reference SD": ref_vals.std(axis=1, ddof=1),
+                "Reference CV (%)": ref_vals.std(axis=1, ddof=1) / ref_vals.mean(axis=1) * 100,
+                "Test Mean": test_vals.mean(axis=1),
+                "Test SD": test_vals.std(axis=1, ddof=1),
+                "Test CV (%)": test_vals.std(axis=1, ddof=1) / test_vals.mean(axis=1) * 100,
+            })
+            summary["Absolute Difference"] = (summary["Reference Mean"] - summary["Test Mean"]).abs()
+            summary["Squared Difference"] = (summary["Reference Mean"] - summary["Test Mean"]) ** 2
+            f2 = 50 * np.log10((1 + summary["Squared Difference"].mean()) ** -0.5 * 100)
+            verdict = "Similar" if f2 >= 50 else "Not Similar"
+            assess = pd.DataFrame({"Similarity Factor f₂": [f2], "Conclusion": [verdict]})
+            report_table(summary, "Dissolution profile summary", decimals)
+            report_table(assess, "Overall f₂ assessment", decimals)
 
-            ref_summary = dis_profile_summary(ref_df)
-            test_summary = dis_profile_summary(test_df)
-            merged = dis_merge_profiles(ref_summary, test_summary)
-            selected, first_both_ge_idx = dis_select_points(
-                merged=merged,
-                include_zero=include_zero,
-                cutoff_mode=cutoff_mode,
-                threshold=threshold
+            fig_main, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+            ax.errorbar(time, summary["Reference Mean"], yerr=summary["Reference SD"], fmt='o-', color=PRIMARY_COLOR, lw=2, capsize=4, label="Reference")
+            ax.errorbar(time, summary["Test Mean"], yerr=summary["Test SD"], fmt='s-', color=SECONDARY_COLOR, lw=2, capsize=4, label="Test")
+            apply_ax_style(ax, f"Dissolution profiles (f₂ = {f2:.{decimals}f})", time_col, "Dissolved (%)", legend=True)
+            st.pyplot(fig_main)
+
+            export_results(
+                prefix="dissolution_f2",
+                report_title="Statistical Analysis Report",
+                module_name="Dissolution Comparison (f₂)",
+                statistical_analysis="Mean dissolution profiles were calculated for the reference and test products at each common time point. Variability was summarized with standard deviation and coefficient of variation. The similarity factor f₂ was then computed from the squared differences between the mean profiles.",
+                offer_text="This analysis offers a concise way to compare two dissolution profiles, identify the size of mean differences across time, and support a similarity conclusion using the commonly used f₂ metric.",
+                python_tools="Python tools used here include pandas and numpy for profile handling, matplotlib for the dissolution plot with error bars, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                table_map={"Profile Summary": summary, "f2 Assessment": assess},
+                figure_map={"Dissolution profiles": fig_to_png_bytes(fig_main)},
+                conclusion=f"The calculated similarity factor was {f2:.{decimals}f}. Based on the usual threshold of 50, the two profiles were classified as {verdict.lower()}.",
+                decimals=decimals,
             )
+        except Exception as e:
+            st.error(str(e))
 
-            if len(selected) < 3:
-                raise ValueError("At least 3 selected timepoints are required to calculate f2.")
 
-            selected = selected.copy()
-            selected["abs_diff"] = (selected["mean_ref"] - selected["mean_test"]).abs()
-            selected["sq_diff"] = (selected["mean_ref"] - selected["mean_test"]) ** 2
+# -------------------------------------------------
+# App 05 Two-Sample Tests
+# -------------------------------------------------
+elif app_selection == "05 - Two-Sample Tests":
+    app_header("⚖️ App 05 - Two-Sample Tests", "Paste one table with headers, then choose any two sample columns to compare.")
+    st.markdown("Paste a **wide** table from Excel. If you paste more than two numeric columns, you can choose which two columns to compare from the dropdowns. The selected headers are used automatically in tables and plots.")
+    data_input = st.text_area("Data table (with headers)", height=240)
+    mode = st.radio("Comparison type", ["Independent samples", "Paired samples"], horizontal=True)
+    alpha = st.slider("Significance level α", 0.001, 0.100, 0.05, 0.001)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="two_dec")
 
-            f2_value = dis_calc_f2(selected["mean_ref"], selected["mean_test"])
-            fda_tbl, fda_detail_tbl, conventional_ok = dis_fda_checks(
-                ref_df=ref_df,
-                test_df=test_df,
-                merged=merged,
-                selected=selected,
-                threshold=threshold,
-                include_zero=include_zero
-            )
+    if data_input:
+        try:
+            df = parse_pasted_table(data_input, header=True)
+            num_cols = get_numeric_columns(df)
+            if len(num_cols) < 2:
+                st.error("Please paste at least two numeric columns with headers.")
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    sample_a = st.selectbox("Sample A", num_cols, index=0)
+                with c2:
+                    sample_b = st.selectbox("Sample B", [c for c in num_cols if c != sample_a], index=0)
 
-            st.markdown("### Result")
-            result_df = pd.DataFrame([{
-                "f2": f2_value,
-                "Conventional_similarity_(f2≥50)": "Yes" if f2_value >= 50 else "No",
-                "Conventional_FDA_checks_pass": "Yes" if conventional_ok else "No",
-                "Selected_timepoints": len(selected)
-            }])
-            display_df(result_df, decimals)
+                x = to_numeric(df[sample_a]).dropna().to_numpy()
+                y = to_numeric(df[sample_b]).dropna().to_numpy()
+                if mode == "Paired samples":
+                    paired_df = df[[sample_a, sample_b]].copy().apply(to_numeric).dropna()
+                    x = paired_df[sample_a].to_numpy()
+                    y = paired_df[sample_b].to_numpy()
+                    if len(x) < 2:
+                        raise ValueError("Paired analysis requires at least two complete pairs.")
 
-            t1, t2, t3, t4 = st.tabs(["Selected Points", "Merged Summary", "FDA Checks", "Plots"])
-            with t1:
-                display_df(selected, decimals)
-            with t2:
-                display_df(merged, decimals)
-            with t3:
-                st.markdown("**FDA / conventional checks**")
-                display_df(fda_tbl, decimals)
-                st.markdown("**Details**")
-                display_df(fda_detail_tbl, decimals)
-            with t4:
-                render_plot(
-                    dis_plot_profiles,
-                    ref_df=ref_df,
-                    test_df=test_df,
-                    ref_summary=ref_summary,
-                    test_summary=test_summary,
-                    selected=selected,
-                    show_units=show_units,
-                    title=plot_title,
-                    ylabel=ylabel
+                def ad(a):
+                    stat, p = normal_ad(a)
+                    return stat, p, p >= alpha
+
+                a1, p1, n1 = ad(x)
+                a2, p2, n2 = ad(y)
+                desc = pd.DataFrame({
+                    "Sample": [sample_a, sample_b],
+                    "N": [len(x), len(y)],
+                    "Mean": [x.mean(), y.mean()],
+                    "Std. Deviation": [x.std(ddof=1), y.std(ddof=1)],
+                    "Median": [np.median(x), np.median(y)],
+                    "Minimum": [x.min(), y.min()],
+                    "Maximum": [x.max(), y.max()],
+                    "AD A* Statistic": [a1, a2],
+                    "AD P-Value": [p1, p2],
+                    "Normal at α": ["Yes" if n1 else "No", "Yes" if n2 else "No"],
+                })
+                report_table(desc, "Sample summary and normality checks", decimals)
+
+                if mode == "Independent samples":
+                    lev_stat, lev_p = stats.levene(x, y)
+                    equal_var = lev_p >= alpha
+                    t_stat, t_p = stats.ttest_ind(x, y, equal_var=equal_var)
+                    mw_stat, mw_p = stats.mannwhitneyu(x, y, alternative="two-sided")
+                    tests = pd.DataFrame({
+                        "Test": ["Levene test", "Student/Welch t-test", "Mann–Whitney U"],
+                        "Statistic": [lev_stat, t_stat, mw_stat],
+                        "P-Value": [lev_p, t_p, mw_p],
+                        "Conclusion": [
+                            "Equal variances" if equal_var else "Unequal variances",
+                            "Significant" if t_p < alpha else "Not significant",
+                            "Significant" if mw_p < alpha else "Not significant",
+                        ],
+                    })
+                    conclusion = f"The comparison between {sample_a} and {sample_b} was evaluated as independent samples. The t-test p-value was {fmt_p(t_p)} and the Mann–Whitney p-value was {fmt_p(mw_p)}."
+                else:
+                    d = x - y
+                    ad_d, p_d, nd = ad(d)
+                    t_stat, t_p = stats.ttest_rel(x, y)
+                    try:
+                        w_stat, w_p = stats.wilcoxon(x, y)
+                    except Exception:
+                        w_stat, w_p = np.nan, np.nan
+                    tests = pd.DataFrame({
+                        "Test": ["AD test of paired differences", "Paired t-test", "Wilcoxon signed-rank"],
+                        "Statistic": [ad_d, t_stat, w_stat],
+                        "P-Value": [p_d, t_p, w_p],
+                        "Conclusion": [
+                            "Normal differences" if nd else "Non-normal differences",
+                            "Significant" if t_p < alpha else "Not significant",
+                            "Significant" if (pd.notna(w_p) and w_p < alpha) else "Not significant",
+                        ],
+                    })
+                    conclusion = f"The comparison between {sample_a} and {sample_b} was evaluated as paired samples. The paired t-test p-value was {fmt_p(t_p)} and the Wilcoxon p-value was {fmt_p(w_p)}."
+
+                report_table(tests, f"Two-sample test results (α = {alpha})", decimals)
+
+                fig_box, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                ax.boxplot([x, y], labels=[sample_a, sample_b], patch_artist=True)
+                apply_ax_style(ax, "Two-sample comparison", "Sample", "Value")
+                st.pyplot(fig_box)
+
+                fig_dens, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
+                if len(np.unique(x)) > 1:
+                    xs = np.linspace(np.min(x), np.max(x), 200)
+                    ax2.plot(xs, gaussian_kde(x)(xs), color=PRIMARY_COLOR, lw=2, label=sample_a)
+                if len(np.unique(y)) > 1:
+                    ys = np.linspace(np.min(y), np.max(y), 200)
+                    ax2.plot(ys, gaussian_kde(y)(ys), color=SECONDARY_COLOR, lw=2, label=sample_b)
+                apply_ax_style(ax2, "Density comparison", "Value", "Density", legend=True)
+                st.pyplot(fig_dens)
+
+                export_results(
+                    prefix="two_sample_tests",
+                    report_title="Statistical Analysis Report",
+                    module_name="Two-Sample Tests",
+                    statistical_analysis="Two selected sample columns from the pasted Excel table were compared. The module first summarized each sample and checked approximate normality using the Anderson–Darling test. For independent samples, equality of variances was assessed with Levene’s test before applying the appropriate t-test; a Mann–Whitney test was also provided as a non-parametric comparison. For paired samples, analyses were based on row-wise differences using the paired t-test and Wilcoxon signed-rank test.",
+                    offer_text="This analysis offers a structured way to compare two populations for differences in means or distributions, verify key assumptions, and switch easily between any two columns from a wider pasted table without repasting data.",
+                    python_tools="Python tools used here include pandas and numpy for selecting the chosen sample columns from the pasted table, statsmodels.stats.diagnostic.normal_ad for Anderson–Darling normality testing, scipy.stats for Levene, t-tests, Mann–Whitney, and Wilcoxon procedures, matplotlib for comparison plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                    table_map={"Summary": desc, "Tests": tests},
+                    figure_map={"Box plot": fig_to_png_bytes(fig_box), "Density plot": fig_to_png_bytes(fig_dens)},
+                    conclusion=conclusion,
+                    decimals=decimals,
                 )
-
-            if bootstrap:
-                ref_mat, _ = dis_get_selected_matrix(ref_df, selected["Time"])
-                test_mat, _ = dis_get_selected_matrix(test_df, selected["Time"])
-                boot_vals = dis_bootstrap_f2(ref_mat, test_mat, n_boot=int(boot_n), seed=int(boot_seed))
-                boot_rows = []
-
-                ci_low = ci_high = None
-                ci_label = f"{int(round(boot_conf*100))}% CI"
-
-                if boot_method in ["percentile", "both"]:
-                    p_low, p_high = dis_percentile_interval(boot_vals, conf=boot_conf)
-                    boot_rows.append({"Method": "Percentile", "CI_low": p_low, "CI_high": p_high})
-                    if boot_method == "percentile":
-                        ci_low, ci_high = p_low, p_high
-
-                if boot_method in ["bca", "both"]:
-                    jack_vals = dis_jackknife_f2(ref_mat, test_mat)
-                    b_low, b_high, z0, a = dis_bca_interval(f2_value, boot_vals, jack_vals, conf=boot_conf)
-                    boot_rows.append({"Method": "BCa", "CI_low": b_low, "CI_high": b_high, "z0": z0, "acceleration": a})
-                    if boot_method == "bca":
-                        ci_low, ci_high = b_low, b_high
-
-                if boot_method == "both" and boot_rows:
-                    ci_low, ci_high = boot_rows[0]["CI_low"], boot_rows[0]["CI_high"]
-
-                st.markdown("### Bootstrap Confidence Intervals")
-                display_df(pd.DataFrame(boot_rows), decimals)
-
-                if show_boot_plot:
-                    render_plot(
-                        dis_plot_bootstrap_f2_distribution,
-                        boot_vals=boot_vals,
-                        observed_f2=f2_value,
-                        ci_low=ci_low,
-                        ci_high=ci_high,
-                        ci_label=ci_label
-                    )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(str(e))
 
-# ==========================================
-# APP 04: TWO-SAMPLE TESTS
-# ==========================================
-elif app_selection == "04 - Two-Sample Tests":
-    st.title("⚖️ App 04 - Two-Sample Tests")
-    st.markdown("Wide or long input. Automatic routing uses Anderson-Darling normality plus Levene variance checking.")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        input_format = st.selectbox("Input format", ["wide", "long"], format_func=lambda x: "Wide: one group per column" if x == "wide" else "Long: group + response columns")
-    with c2:
-        design = st.selectbox("Design", ["independent", "paired"], format_func=lambda x: "Independent groups" if x == "independent" else "Paired data")
-
-    default_ts_data = TS_WIDE_SAMPLE if input_format == "wide" else TS_LONG_SAMPLE
-    data_input = st.text_area("Data", value=default_ts_data, height=220)
-
-    try:
-        df_raw = ts_parse_raw_table(data_input)
-        df_loaded = ts_promote_header_if_needed(df_raw)
-        st.markdown("### Preview")
-        st.dataframe(df_loaded.head(20), use_container_width=True)
-    except Exception as e:
-        df_loaded = None
-        st.error(f"Could not parse data: {e}")
-
-    group_col = response_col = None
-    if df_loaded is not None and input_format == "long":
-        guessed_group, guessed_response = ts_guess_long_columns(df_loaded)
-        c1, c2 = st.columns(2)
-        with c1:
-            group_col = st.selectbox("Group column", options=list(df_loaded.columns), index=list(df_loaded.columns).index(guessed_group) if guessed_group in df_loaded.columns else 0)
-        with c2:
-            response_col = st.selectbox("Response column", options=list(df_loaded.columns), index=list(df_loaded.columns).index(guessed_response) if guessed_response in df_loaded.columns else min(1, len(df_loaded.columns)-1))
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        alpha = st.slider("Alpha", 0.001, 0.20, 0.05, 0.001)
-    with c2:
-        route_mode = st.selectbox("Route", ["auto", "parametric_equal", "welch", "nonparametric"], format_func=lambda x: {
-            "auto": "Auto choose test",
-            "parametric_equal": "Force equal-variance parametric",
-            "welch": "Force Welch route",
-            "nonparametric": "Force nonparametric",
-        }[x])
-    with c3:
-        decimals = st.slider("Decimals", 1, 8, 4)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        plot_title = st.text_input("Plot title", value="Group Comparison")
-    with c2:
-        ylabel = st.text_input("Y label", value="Response")
-    with c3:
-        show_plot = st.checkbox("Show plot", value=True)
-    with c4:
-        show_points = st.checkbox("Show raw points", value=True)
-
-    if st.button("Run Comparison", type="primary"):
+# -------------------------------------------------
+# App 06 Two-Way ANOVA
+# -------------------------------------------------
+elif app_selection == "06 - Two-Way ANOVA":
+    app_header("📐 App 06 - Two-Way ANOVA", "Analyze two categorical factors and their interaction for a selected numeric response.")
+    data_input = st.text_area("Paste data with headers", height=240)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="anova2_dec")
+    if data_input:
         try:
-            if df_loaded is None:
-                raise ValueError("Please provide a valid table.")
+            df = parse_pasted_table(data_input, header=True)
+            all_cols = list(df.columns)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                factor_a = st.selectbox("Factor A", all_cols, index=0)
+            with c2:
+                factor_b = st.selectbox("Factor B", [c for c in all_cols if c != factor_a], index=0)
+            with c3:
+                response = st.selectbox("Response", [c for c in all_cols if c not in [factor_a, factor_b]], index=0)
+            d = df[[factor_a, factor_b, response]].copy()
+            d[response] = to_numeric(d[response])
+            d = d.dropna().rename(columns={factor_a: "FactorA", factor_b: "FactorB", response: "Response"})
+            model = smf.ols("Response ~ C(FactorA) * C(FactorB)", data=d).fit()
+            raw_anova = anova_lm(model, typ=2)
 
-            paired_data = None
-            if input_format == "wide":
-                if design == "paired":
-                    long_df, groups, name1, name2, x1, x2 = ts_prepare_wide_paired(df_loaded)
-                    paired_data = (name1, name2, x1, x2)
-                else:
-                    long_df, groups = ts_prepare_wide(df_loaded)
-            else:
-                if design == "paired":
-                    raise ValueError("Paired mode is supported here only for wide input with exactly two columns.")
-                long_df, groups = ts_prepare_long(df_loaded, group_col, response_col)
+            st.markdown(f"**Model: {response} ~ {factor_a} + {factor_b} + {factor_a} * {factor_b}**")
 
-            summary_tbl = ts_group_summary(long_df)
-            selected_test, norm_tbl, lev_stat, lev_p = ts_choose_test(
-                groups=groups,
-                alpha=alpha,
-                route_mode=route_mode,
-                design=design,
-                paired_data=paired_data
+            anova_rows = []
+            mapping = [
+                ("C(FactorA)", factor_a),
+                ("C(FactorB)", factor_b),
+                ("C(FactorA):C(FactorB)", "Interaction"),
+            ]
+            for idx, label in mapping:
+                if idx in raw_anova.index:
+                    row = raw_anova.loc[idx]
+                    dfv = row.get("df", np.nan)
+                    ss = row.get("sum_sq", np.nan)
+                    anova_rows.append({
+                        "Source": label,
+                        "DF": dfv,
+                        "Sum of Squares": ss,
+                        "Mean Square": ss / dfv if pd.notna(dfv) and dfv != 0 else np.nan,
+                        "F Value": row.get("F", np.nan),
+                        "P Value": row.get("PR(>F)", np.nan),
+                    })
+            if "Residual" in raw_anova.index:
+                row = raw_anova.loc["Residual"]
+                dfv = row.get("df", np.nan)
+                ss = row.get("sum_sq", np.nan)
+                anova_rows.append({
+                    "Source": "Error",
+                    "DF": dfv,
+                    "Sum of Squares": ss,
+                    "Mean Square": ss / dfv if pd.notna(dfv) and dfv != 0 else np.nan,
+                    "F Value": np.nan,
+                    "P Value": np.nan,
+                })
+            anova_rows.append({
+                "Source": "N",
+                "DF": len(d),
+                "Sum of Squares": np.nan,
+                "Mean Square": np.nan,
+                "F Value": np.nan,
+                "P Value": np.nan,
+            })
+            anova = pd.DataFrame(anova_rows)
+            report_table(anova, "Two-way ANOVA table", decimals)
+
+            summary = d.groupby(["FactorA", "FactorB"])["Response"].agg(["count", "mean", "std", "min", "max"]).reset_index()
+            summary.columns = [factor_a, factor_b, "N", "Mean", "Std. Deviation", "Minimum", "Maximum"]
+            report_table(summary, "Cell summary statistics", decimals)
+
+            fig_inter, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+            for lvl in d["FactorB"].astype(str).unique():
+                sub = d[d["FactorB"].astype(str) == lvl]
+                means = sub.groupby("FactorA")["Response"].mean().reset_index()
+                ax.plot(means["FactorA"].astype(str), means["Response"], marker='o', lw=2, label=f"{factor_b} = {lvl}")
+            apply_ax_style(ax, "Interaction plot", factor_a, response, legend=True)
+            st.pyplot(fig_inter)
+
+            fig_res = residual_plot(model.fittedvalues, model.resid, xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+            st.pyplot(fig_res)
+            fig_qq = qq_plot(model.resid, title="Normal probability plot of ANOVA residuals")
+            st.pyplot(fig_qq)
+
+            export_results(
+                prefix="two_way_anova",
+                report_title="Statistical Analysis Report",
+                module_name="Two-Way ANOVA",
+                statistical_analysis="A two-way analysis of variance was fitted to the selected response variable using two chosen categorical factors and their interaction. Sums of squares, mean squares, F statistics, and p-values were computed from the linear model, and residual diagnostics were generated to support assessment of model assumptions.",
+                offer_text="This analysis offers a direct way to quantify the main effects of two factors, test whether their interaction is present, compare cell means, and visualize whether factor effects are consistent across levels of the other factor.",
+                python_tools="Python tools used here include pandas and numpy for column selection and aggregation, statsmodels.formula.api and statsmodels.stats.anova for model fitting and ANOVA calculations, matplotlib for interaction and residual plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                table_map={"ANOVA": anova, "Cell Summary": summary},
+                figure_map={
+                    "Interaction plot": fig_to_png_bytes(fig_inter),
+                    "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                    "Normal probability plot": fig_to_png_bytes(fig_qq),
+                },
+                conclusion="The ANOVA table reports whether the selected factors and their interaction contributed significantly to variation in the selected response.",
+                decimals=decimals,
             )
-            result = ts_run_test(groups, selected_test, paired_data=paired_data)
-
-            st.markdown("### Test Result")
-            result_df = pd.DataFrame([result])
-            display_df(result_df, decimals)
-
-            if "pvalue" in result and pd.notna(result["pvalue"]):
-                if float(result["pvalue"]) < alpha:
-                    st.warning(f"Result is significant at alpha = {alpha:.3f}.")
-                else:
-                    st.success(f"Result is not significant at alpha = {alpha:.3f}.")
-
-            t1, t2, t3 = st.tabs(["Group Summary", "Assumption Checks", "Plot"])
-            with t1:
-                display_df(summary_tbl, decimals)
-            with t2:
-                st.markdown("**Normality**")
-                display_df(norm_tbl, decimals)
-                if design != "paired":
-                    lev_df = pd.DataFrame([{
-                        "Levene_stat": lev_stat,
-                        "Levene_pvalue": lev_p,
-                        "Equal_variance_at_alpha": "Yes" if pd.notna(lev_p) and lev_p >= alpha else "No"
-                    }])
-                    st.markdown("**Variance check**")
-                    display_df(lev_df, decimals)
-            with t3:
-                if show_plot:
-                    render_plot(
-                        ts_plot_groups,
-                        long_df=long_df,
-                        title=plot_title,
-                        ylabel=ylabel,
-                        show_points=show_points,
-                        design=design
-                    )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(str(e))
 
-# ==========================================
-# APP 05: TWO-WAY ANOVA
-# ==========================================
-elif app_selection == "05 - Two-Way ANOVA":
-    st.title("📐 App 05 - Two-Way ANOVA")
-    st.markdown("Paste long-format data, choose one response plus two factors, and get ANOVA, means, counts, and an interaction plot.")
 
-    data_input = st.text_area("Data", value=TWA_SAMPLE, height=220)
+# -------------------------------------------------
+# App 07 Tolerance & Confidence Intervals
+# -------------------------------------------------
+elif app_selection == "07 - Tolerance & Confidence Intervals":
+    app_header("🎯 App 07 - Tolerance & Confidence Intervals", "Generate confidence intervals and normal-theory tolerance intervals for one or two samples.")
+    data_input = st.text_area("Paste one table with headers", height=240)
+    confidence = st.slider("Confidence level (%)", 80, 99, 95)
+    coverage = st.slider("Population coverage for TI (%)", 80, 99, 95)
+    paired = st.checkbox("Paired comparison for difference in means", value=False)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="ti_dec")
 
-    try:
-        df_raw = twa_parse_pasted_table(data_input)
-        df_loaded = twa_clean_dataframe(df_raw)
-        guessed_response, guessed_a, guessed_b = twa_guess_columns(df_loaded)
-        st.markdown("### Preview")
-        st.dataframe(df_loaded.head(20), use_container_width=True)
-    except Exception as e:
-        df_loaded = None
-        st.error(f"Could not parse data: {e}")
-
-    if df_loaded is not None:
-        cols = list(df_loaded.columns)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            response_col = st.selectbox("Response", cols, index=cols.index(guessed_response) if guessed_response in cols else 0)
-        with c2:
-            factor_a_col = st.selectbox("Factor A", cols, index=cols.index(guessed_a) if guessed_a in cols else 0)
-        with c3:
-            factor_b_col = st.selectbox("Factor B", cols, index=cols.index(guessed_b) if guessed_b in cols else min(1, len(cols)-1))
-    else:
-        response_col = factor_a_col = factor_b_col = None
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        include_interaction = st.checkbox("Include interaction", value=True)
-    with c2:
-        anova_type = st.selectbox("ANOVA type", [2, 3], format_func=lambda x: f"Type {x} SS")
-    with c3:
-        show_plot = st.checkbox("Show interaction plot", value=True)
-    with c4:
-        show_points = st.checkbox("Show raw points", value=True)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        plot_title = st.text_input("Plot title", value="Interaction Plot")
-    with c2:
-        ylabel = st.text_input("Y label", value="Response")
-    with c3:
-        decimals = st.slider("Decimals", 1, 8, 4)
-
-    if st.button("Run Two-Way ANOVA", type="primary"):
+    if data_input:
         try:
-            if df_loaded is None:
-                raise ValueError("Please provide a valid table.")
-
-            if len({response_col, factor_a_col, factor_b_col}) < 3:
-                raise ValueError("Response, Factor A, and Factor B must be different columns.")
-
-            df_analysis = twa_prepare_analysis_df(df_loaded, response_col, factor_a_col, factor_b_col)
-            model, anova_tbl = twa_fit_model(df_analysis, include_interaction=include_interaction, typ=int(anova_type))
-            summary_tbl = twa_make_group_summary(df_analysis)
-            means_tbl = twa_make_means_table(df_analysis)
-            counts_tbl = twa_make_counts_table(df_analysis)
-
-            t1, t2, t3, t4 = st.tabs(["ANOVA", "Group Summary", "Means & Counts", "Plot"])
-            with t1:
-                display_df(anova_tbl, decimals)
-            with t2:
-                display_df(summary_tbl, decimals)
-            with t3:
-                st.markdown("**Means table**")
-                display_df(means_tbl, decimals)
-                st.markdown("**Counts table**")
-                display_df(counts_tbl, decimals)
-            with t4:
-                if show_plot:
-                    render_plot(
-                        twa_plot_interaction,
-                        df_analysis=df_analysis,
-                        ylabel=ylabel,
-                        title=plot_title,
-                        show_points=show_points
-                    )
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-# ==========================================
-# APP 06: TOLERANCE & CONFIDENCE INTERVALS
-# ==========================================
-elif app_selection == "06 - Tolerance & Confidence Intervals":
-    st.title("🎯 App 06 - Tolerance & Confidence Intervals")
-    st.markdown("Two groups only. Computes mean confidence intervals, a difference-in-means confidence interval, and normal-based tolerance intervals.")
-
-    input_format = st.selectbox("Input format", ["wide", "long"], format_func=lambda x: "Wide: two columns" if x == "wide" else "Long: group + response")
-    default_tc_data = TC_WIDE_SAMPLE if input_format == "wide" else TC_LONG_SAMPLE
-    data_input = st.text_area("Data", value=default_tc_data, height=220)
-
-    try:
-        df_raw = tc_parse_raw_table(data_input)
-        df_loaded = tc_promote_header_if_needed(df_raw)
-        st.markdown("### Preview")
-        st.dataframe(df_loaded.head(20), use_container_width=True)
-    except Exception as e:
-        df_loaded = None
-        st.error(f"Could not parse data: {e}")
-
-    group_col = response_col = None
-    if df_loaded is not None and input_format == "long":
-        guessed_group, guessed_response = tc_guess_long_columns(df_loaded)
-        c1, c2 = st.columns(2)
-        with c1:
-            group_col = st.selectbox("Group column", options=list(df_loaded.columns), index=list(df_loaded.columns).index(guessed_group) if guessed_group in df_loaded.columns else 0)
-        with c2:
-            response_col = st.selectbox("Response column", options=list(df_loaded.columns), index=list(df_loaded.columns).index(guessed_response) if guessed_response in df_loaded.columns else min(1, len(df_loaded.columns)-1))
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ci_conf = st.slider("CI confidence", 0.80, 0.99, 0.95, 0.01)
-    with c2:
-        diff_method = st.selectbox("Difference CI method", ["auto", "pooled", "welch"], format_func=lambda x: {
-            "auto": "Auto (Levene -> pooled/Welch)",
-            "pooled": "Pooled",
-            "welch": "Welch"
-        }[x])
-    with c3:
-        alpha_chk = st.slider("Alpha for checks", 0.001, 0.20, 0.05, 0.001)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        tol_conf = st.slider("Tolerance confidence", 0.80, 0.99, 0.95, 0.01)
-    with c2:
-        tol_cov = st.slider("Tolerance coverage", 0.50, 0.999, 0.95, 0.005)
-    with c3:
-        tol_side = st.selectbox("Tolerance side", ["two-sided", "upper", "lower"], format_func=lambda x: {"two-sided": "Two-sided", "upper": "Upper", "lower": "Lower"}[x])
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        plot_title = st.text_input("Plot title", value="Confidence and Tolerance Intervals by Group")
-    with c2:
-        ylabel = st.text_input("Y label", value="Response")
-    with c3:
-        show_plot = st.checkbox("Show plot", value=True)
-    with c4:
-        show_points = st.checkbox("Show raw points", value=True)
-
-    decimals = st.slider("Decimals", 1, 8, 4)
-
-    if st.button("Run Intervals", type="primary"):
-        try:
-            if df_loaded is None:
-                raise ValueError("Please provide a valid table.")
-
-            if input_format == "wide":
-                long_df, groups = tc_prepare_wide(df_loaded)
+            df = parse_pasted_table(data_input, header=True)
+            num_cols = get_numeric_columns(df)
+            if not num_cols:
+                st.error("No numeric columns were found.")
             else:
-                long_df, groups = tc_prepare_long(df_loaded, group_col, response_col)
+                c1, c2 = st.columns(2)
+                with c1:
+                    sample_a = st.selectbox("Sample A", num_cols, index=0)
+                with c2:
+                    sample_b = st.selectbox("Sample B (optional)", ["(None)"] + [c for c in num_cols if c != sample_a], index=0)
+                alpha = 1 - confidence / 100
+                p = coverage / 100
+                conf = confidence / 100
+                x = to_numeric(df[sample_a]).dropna().to_numpy()
+                summaries = []
 
-            group_names = list(groups.keys())
-            diff_res = tc_diff_mean_ci(
-                groups[group_names[0]],
-                groups[group_names[1]],
-                conf=ci_conf,
-                method=diff_method,
-                alpha_var=alpha_chk
-            )
-            diff_res["Comparison"] = f"{group_names[0]} - {group_names[1]}"
+                def mean_ci(a):
+                    n = len(a)
+                    m = np.mean(a)
+                    s = np.std(a, ddof=1)
+                    se = s / np.sqrt(n)
+                    tcrit = t.ppf(1 - alpha / 2, n - 1)
+                    return m, s, m - tcrit * se, m + tcrit * se
 
-            ad_tbl = tc_ad_table(groups, alpha_chk)
-            summary_tbl = tc_group_summary(groups)
-            ci_tbl = tc_ci_table(groups, conf=ci_conf)
-            ti_tbl = tc_ti_table(groups, conf=tol_conf, coverage=tol_cov, side=tol_side)
+                mx, sx, lx, ux = mean_ci(x)
+                _, tlx, tux = tolerance_interval_normal(x, p=p, conf=conf, two_sided=True)
+                summaries.append({"Sample": sample_a, "N": len(x), "Mean": mx, "Std. Deviation": sx, f"{confidence}% CI Lower": lx, f"{confidence}% CI Upper": ux, f"{coverage}%/{confidence}% TI Lower": tlx, f"{coverage}%/{confidence}% TI Upper": tux})
+                diff_tbl = None
+                if sample_b != "(None)":
+                    y_all = df[[sample_a, sample_b]].copy().apply(to_numeric) if paired else None
+                    y = (y_all[sample_b].dropna().to_numpy() if not paired else y_all[sample_b].dropna().to_numpy()) if paired else to_numeric(df[sample_b]).dropna().to_numpy()
+                    if paired:
+                        pair_df = df[[sample_a, sample_b]].copy().apply(to_numeric).dropna()
+                        x = pair_df[sample_a].to_numpy()
+                        y = pair_df[sample_b].to_numpy()
+                    my, sy, ly, uy = mean_ci(y)
+                    _, tly, tuy = tolerance_interval_normal(y, p=p, conf=conf, two_sided=True)
+                    summaries.append({"Sample": sample_b, "N": len(y), "Mean": my, "Std. Deviation": sy, f"{confidence}% CI Lower": ly, f"{confidence}% CI Upper": uy, f"{coverage}%/{confidence}% TI Lower": tly, f"{coverage}%/{confidence}% TI Upper": tuy})
 
-            t1, t2, t3, t4 = st.tabs(["Group Summary", "Normality & Difference CI", "CI & TI Tables", "Plot"])
-            with t1:
-                display_df(summary_tbl, decimals)
-            with t2:
-                st.markdown("**Normality**")
-                display_df(ad_tbl, decimals)
-                st.markdown("**Difference in means CI**")
-                display_df(pd.DataFrame([diff_res]), decimals)
-            with t3:
-                st.markdown("**Mean confidence intervals**")
-                display_df(ci_tbl, decimals)
-                st.markdown("**Tolerance intervals**")
-                display_df(ti_tbl, decimals)
-            with t4:
-                if show_plot:
-                    render_plot(
-                        tc_plot_intervals,
-                        long_df=long_df,
-                        ci_tbl=ci_tbl,
-                        ti_tbl=ti_tbl,
-                        title=plot_title,
-                        ylabel=ylabel,
-                        show_points=show_points
-                    )
+                    if paired:
+                        d = x - y
+                        md, sd, ld, ud = mean_ci(d)
+                        diff_tbl = pd.DataFrame({"Comparison": [f"{sample_a} - {sample_b}"], "Mean Difference": [md], f"{confidence}% CI Lower": [ld], f"{confidence}% CI Upper": [ud]})
+                    else:
+                        nx, ny = len(x), len(y)
+                        dx = x.mean() - y.mean()
+                        sx2, sy2 = x.var(ddof=1), y.var(ddof=1)
+                        se = np.sqrt(sx2 / nx + sy2 / ny)
+                        dfw = (sx2 / nx + sy2 / ny) ** 2 / (((sx2 / nx) ** 2) / (nx - 1) + ((sy2 / ny) ** 2) / (ny - 1))
+                        tcrit = t.ppf(1 - alpha / 2, dfw)
+                        diff_tbl = pd.DataFrame({"Comparison": [f"{sample_a} - {sample_b}"], "Mean Difference": [dx], f"{confidence}% CI Lower": [dx - tcrit * se], f"{confidence}% CI Upper": [dx + tcrit * se]})
+
+                out = pd.DataFrame(summaries)
+                report_table(out, "Confidence and tolerance intervals", decimals)
+                table_map = {"Intervals": out}
+                if diff_tbl is not None:
+                    report_table(diff_tbl, "Confidence interval for mean difference", decimals)
+                    table_map["Mean Difference CI"] = diff_tbl
+
+                data_list = [to_numeric(df[sample_a]).dropna().to_numpy()] if sample_b == "(None)" else ([x, y] if paired else [to_numeric(df[sample_a]).dropna().to_numpy(), to_numeric(df[sample_b]).dropna().to_numpy()])
+                labels = [sample_a] if sample_b == "(None)" else [sample_a, sample_b]
+                fig_box, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                ax.boxplot(data_list, labels=labels, patch_artist=True)
+                apply_ax_style(ax, "Sample distributions", "Sample", "Value")
+                st.pyplot(fig_box)
+
+                export_results(
+                    prefix="tolerance_confidence_intervals",
+                    report_title="Statistical Analysis Report",
+                    module_name="Tolerance & Confidence Intervals",
+                    statistical_analysis="For each selected sample column, a confidence interval for the mean was calculated using the t distribution. In addition, a normal-theory tolerance interval was calculated to estimate a range expected to contain a chosen proportion of the population with the chosen confidence level. When two samples were selected, a confidence interval for the mean difference was also computed.",
+                    offer_text="This analysis offers a concise way to summarize uncertainty around the sample mean, estimate population coverage ranges, and compare two populations for differences in means while using the pasted column headers directly in the results.",
+                    python_tools="Python tools used here include pandas and numpy for extracting selected columns, scipy.stats for t and tolerance-interval related calculations, matplotlib for distribution plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                    table_map=table_map,
+                    figure_map={"Box plot": fig_to_png_bytes(fig_box)},
+                    conclusion="Confidence intervals quantify uncertainty around the sample mean, while tolerance intervals provide an estimated range expected to contain a specified share of the full population.",
+                    decimals=decimals,
+                )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(str(e))
 
-# ==========================================
-# APP 07: PCA ANALYSIS
-# ==========================================
-elif app_selection == "07 - PCA Analysis":
-    st.title("🌐 App 07 - PCA Analysis")
-    st.markdown("Paste multivariate data, choose variables, and generate scores, loadings, scree, and cumulative variance plots.")
 
-    data_input = st.text_area("Data", value=PCA_SAMPLE, height=240)
-
-    try:
-        df_loaded = pca_parse_table(data_input)
-        numeric_cols = pca_numeric_candidates(df_loaded)
-        all_cols = list(df_loaded.columns)
-        st.markdown("### Preview")
-        st.dataframe(df_loaded.head(20), use_container_width=True)
-    except Exception as e:
-        df_loaded = None
-        numeric_cols = []
-        all_cols = []
-        st.error(f"Could not parse data: {e}")
-
-    if df_loaded is not None and numeric_cols:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            feature_cols = st.multiselect("Variables", options=numeric_cols, default=numeric_cols)
-        with c2:
-            label_col = st.selectbox("Label column", options=["(None)"] + all_cols)
-        with c3:
-            group_col = st.selectbox("Group column", options=["(None)"] + all_cols)
-    else:
-        feature_cols = []
-        label_col = "(None)"
-        group_col = "(None)"
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        prep_mode = st.selectbox("Preprocess", ["none", "center", "autoscale"], format_func=lambda x: {"none": "None", "center": "Mean-center", "autoscale": "Autoscale"}[x])
-    with c2:
-        max_pcs = max(2, min(10, len(feature_cols) if len(feature_cols) > 0 else 2))
-        n_components = st.slider("PCs", 2, max_pcs, min(3, max_pcs))
-    with c3:
-        ellipse_mode = st.selectbox("Ellipse", ["none", "3sigma", "mahal_95", "mahal_99"], format_func=lambda x: {
-            "none": "None", "3sigma": "3σ ellipse", "mahal_95": "95% Mahalanobis", "mahal_99": "99% Mahalanobis"
-        }[x])
-    with c4:
-        ellipse_scope = st.selectbox("Ellipse scope", ["overall", "by_group"], format_func=lambda x: "Overall" if x == "overall" else "By group")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        show_labels = st.checkbox("Show labels", value=True)
-    with c2:
-        show_scree = st.checkbox("Show scree plot", value=True)
-    with c3:
-        show_cum = st.checkbox("Show cumulative plot", value=True)
-    with c4:
-        show_scores = st.checkbox("Show scores plot", value=True)
-    with c5:
-        show_loadings = st.checkbox("Show loadings plot", value=True)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        scores_title = st.text_input("Scores title", value="Scores Plot")
-    with c2:
-        loadings_title = st.text_input("Loadings title", value="Loadings Plot")
-    with c3:
-        decimals = st.slider("Decimals", 1, 8, 4)
-
-    if st.button("Run PCA", type="primary"):
+# -------------------------------------------------
+# App 08 PCA Analysis
+# -------------------------------------------------
+elif app_selection == "08 - PCA Analysis":
+    app_header("🌐 App 08 - PCA Analysis", "Reduce multivariate data to principal components and visualize scores and loadings.")
+    data_input = st.text_area("Paste data with headers", height=240)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="pca_dec")
+    if data_input:
         try:
-            if df_loaded is None:
-                raise ValueError("Please provide a valid table.")
-            if len(feature_cols) < 2:
-                raise ValueError("Choose at least two numeric variables.")
+            df = parse_pasted_table(data_input, header=True)
+            num_cols = get_numeric_columns(df)
+            all_cols = list(df.columns)
+            c1, c2, c3 = st.columns([1.25, 1, 1])
+            with c1:
+                vars_sel = st.multiselect("Numeric variables", num_cols, default=num_cols)
+            with c2:
+                label_col = st.selectbox("Label column (optional)", ["(None)"] + all_cols)
+            with c3:
+                group_col = st.selectbox("Group column (optional)", ["(None)"] + [c for c in all_cols if c != label_col])
+            if len(vars_sel) >= 2:
+                X = df[vars_sel].apply(to_numeric).dropna()
+                Z = (X - X.mean()) / X.std(ddof=1)
+                pca = PCA(n_components=2)
+                scores = pca.fit_transform(Z)
+                loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
+                exp = pca.explained_variance_ratio_ * 100
+                eig = pd.DataFrame({"Principal Component": ["PC1", "PC2"], "Eigenvalue": pca.explained_variance_, "Variance Explained (%)": exp, "Cumulative Variance (%)": np.cumsum(exp)})
+                load_df = pd.DataFrame({"Variable": vars_sel, "PC1": loadings[:, 0], "PC2": loadings[:, 1]})
+                report_table(eig, "Eigenvalues and explained variance", decimals)
+                report_table(load_df, "Loading matrix", decimals)
 
-            X, meta = pca_prepare_matrix(df_loaded, feature_cols, label_col=label_col, group_col=group_col)
-            Xp, prep_info = pca_preprocess(X, prep_mode)
+                scores_df = pd.DataFrame({"PC1": scores[:, 0], "PC2": scores[:, 1]}, index=X.index)
+                if label_col != "(None)":
+                    scores_df["Label"] = df.loc[X.index, label_col].astype(str).values
+                if group_col != "(None)":
+                    scores_df["Group"] = df.loc[X.index, group_col].astype(str).values
 
-            n_components_eff = min(int(n_components), Xp.shape[0], Xp.shape[1])
-            pca_model, scores_df, loadings_df, explained_df = pca_run(Xp, n_components=n_components_eff)
+                fig_scores, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                if group_col != "(None)":
+                    unique_groups = scores_df["Group"].unique()
+                    for grp in unique_groups:
+                        m = scores_df["Group"] == grp
+                        ax.scatter(scores_df.loc[m, "PC1"], scores_df.loc[m, "PC2"], s=46, label=str(grp))
+                        draw_conf_ellipse(scores_df.loc[m, ["PC1", "PC2"]].to_numpy(), ax)
+                else:
+                    ax.scatter(scores_df["PC1"], scores_df["PC2"], s=46, color=PRIMARY_COLOR)
+                    draw_conf_ellipse(scores_df[["PC1", "PC2"]].to_numpy(), ax)
+                if label_col != "(None)":
+                    for _, row in scores_df.iterrows():
+                        ax.text(row["PC1"], row["PC2"], str(row["Label"]), fontsize=8)
+                ax.axhline(0, color="#64748b", lw=1)
+                ax.axvline(0, color="#64748b", lw=1)
+                apply_ax_style(ax, "PCA score plot", f"PC1 ({exp[0]:.1f}% var)", f"PC2 ({exp[1]:.1f}% var)", legend=(group_col != "(None)"))
+                st.pyplot(fig_scores)
 
-            scores_out = pd.concat([meta.reset_index(drop=True), scores_df.reset_index(drop=True)], axis=1)
-            loadings_out = loadings_df.copy()
-            loadings_out.insert(0, "Variable", list(X.columns))
+                fig_load, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
+                ax2.axhline(0, color="#64748b", lw=1)
+                ax2.axvline(0, color="#64748b", lw=1)
+                for i, var in enumerate(vars_sel):
+                    ax2.arrow(0, 0, loadings[i, 0], loadings[i, 1], head_width=0.03, length_includes_head=True, color=PRIMARY_COLOR)
+                    ax2.text(loadings[i, 0], loadings[i, 1], var)
+                apply_ax_style(ax2, "PCA loading plot", "PC1", "PC2")
+                st.pyplot(fig_load)
 
-            t1, t2, t3 = st.tabs(["PCA Tables", "Scores & Loadings", "Plots"])
-            with t1:
-                st.markdown("**Preprocessing summary**")
-                display_df(prep_info, decimals)
-                st.markdown("**Explained variance**")
-                display_df(explained_df, decimals)
-            with t2:
-                st.markdown("**Scores**")
-                display_df(scores_out, decimals)
-                st.markdown("**Loadings**")
-                display_df(loadings_out, decimals)
-            with t3:
-                if show_scree:
-                    render_plot(pca_plot_scree, explained_df=explained_df, title="Scree Plot")
-                if show_cum:
-                    render_plot(pca_plot_cumulative, explained_df=explained_df, title="Cumulative Explained Variance")
-                if show_scores and scores_df.shape[1] >= 2:
-                    render_plot(
-                        pca_plot_scores,
-                        scores_df=scores_df,
-                        meta_df=meta,
-                        explained_df=explained_df,
-                        show_labels=show_labels,
-                        title=scores_title,
-                        ellipse_mode=ellipse_mode,
-                        ellipse_scope=ellipse_scope
-                    )
-                if show_loadings and loadings_df.shape[1] >= 2:
-                    render_plot(
-                        pca_plot_loadings,
-                        loadings_df=loadings_df,
-                        variable_names=list(X.columns),
-                        explained_df=explained_df,
-                        title=loadings_title
-                    )
+                export_results(
+                    prefix="pca_analysis",
+                    report_title="Statistical Analysis Report",
+                    module_name="PCA Analysis",
+                    statistical_analysis="Principal component analysis was performed on the selected numeric variables after standardization to zero mean and unit variance. Eigenvalues, explained variance, component scores, and variable loadings were calculated, and optional pasted header columns were used as point labels or groups on the score plot.",
+                    offer_text="This analysis offers a way to reduce dimensionality, detect clustering or separation patterns, identify influential variables, and visualize multivariate relationships while retaining labels or grouping information from the pasted Excel headers.",
+                    python_tools="Python tools used here include pandas and numpy for data handling and standardization, sklearn.decomposition.PCA for principal component analysis, matplotlib for score and loading plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                    table_map={"Explained Variance": eig, "Loadings": load_df, "Scores": scores_df.reset_index(drop=True)},
+                    figure_map={"PCA score plot": fig_to_png_bytes(fig_scores), "PCA loading plot": fig_to_png_bytes(fig_load)},
+                    conclusion="The PCA score plot summarizes sample-level multivariate patterns, while the loading plot shows which variables are driving separation along PC1 and PC2.",
+                    decimals=decimals,
+                )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(str(e))
 
+
+# -------------------------------------------------
+# App 09 DoE / Response Surfaces
+# -------------------------------------------------
+elif app_selection == "09 - DoE / Response Surfaces":
+    app_header("🧪 App 09 - DoE / Response Surfaces", "Fit linear, interaction, or quadratic DoE models and visualize contour and surface plots.")
+    data_input = st.text_area("Paste data with headers", height=240)
+    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="doe_dec")
+    if data_input:
+        try:
+            df = parse_pasted_table(data_input, header=True)
+            num_cols = get_numeric_columns(df)
+            c1, c2, c3 = st.columns([1.35, 1, 1])
+            with c1:
+                factors = st.multiselect("Numeric factors", num_cols, default=num_cols[: min(2, len(num_cols))])
+            with c2:
+                response = st.selectbox("Response", [c for c in num_cols if c not in factors] or num_cols)
+            with c3:
+                model_type = st.selectbox("Model type", ["linear", "interaction", "quadratic"])
+
+            if len(factors) >= 2:
+                d = df[factors + [response]].copy()
+                for c in factors + [response]:
+                    d[c] = to_numeric(d[c])
+                d = d.dropna()
+                safe_factor_names = [f"F{i+1}" for i in range(len(factors))]
+                rename_map = {orig: safe for orig, safe in zip(factors, safe_factor_names)}
+                safe_df = d.rename(columns=rename_map).rename(columns={response: "Response"})
+                formula = doe_formula(safe_factor_names, model_type=model_type)
+                model = smf.ols(formula, data=safe_df).fit()
+                anova = anova_lm(model, typ=2).reset_index().rename(columns={"index": "Source", "sum_sq": "Sum of Squares", "df": "df", "F": "F-Statistic", "PR(>F)": "P-Value"})
+                anova["SS (%)"] = anova["Sum of Squares"] / anova["Sum of Squares"].sum() * 100
+                coef = pd.DataFrame({"Term": model.params.index, "Coefficient": model.params.values, "P-Value": model.pvalues.values})
+                report_table(anova, f"DoE ANOVA ({model_type} model)", decimals)
+                report_table(coef, "Model coefficients", decimals)
+
+                xfac = st.selectbox("X-axis factor", factors, index=0)
+                yfac = st.selectbox("Y-axis factor", [f for f in factors if f != xfac], index=0)
+                other_factors = [f for f in factors if f not in [xfac, yfac]]
+                fixed_vals = {}
+                if other_factors:
+                    st.markdown("**Fixed levels for remaining factors**")
+                    cols = st.columns(len(other_factors))
+                    for i, f in enumerate(other_factors):
+                        fixed_vals[f] = cols[i].number_input(f, value=float(d[f].mean()))
+
+                x_vals = np.linspace(d[xfac].min(), d[xfac].max(), 40)
+                y_vals = np.linspace(d[yfac].min(), d[yfac].max(), 40)
+                xx, yy = np.meshgrid(x_vals, y_vals)
+                grid = pd.DataFrame({xfac: xx.ravel(), yfac: yy.ravel()})
+                for f in other_factors:
+                    grid[f] = fixed_vals[f]
+                safe_grid = grid.rename(columns=rename_map)
+                zz = model.predict(safe_grid).to_numpy().reshape(xx.shape)
+
+                fig_contour, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                cs = ax.contourf(xx, yy, zz, levels=20, cmap="viridis")
+                fig_contour.colorbar(cs, ax=ax, label=response)
+                ax.scatter(d[xfac], d[yfac], c="white", edgecolor="black", s=34)
+                apply_ax_style(ax, f"Contour plot for {response}", xfac, yfac)
+                st.pyplot(fig_contour)
+
+                fig_surface = plt.figure(figsize=(FIG_W, FIG_H + 0.5))
+                ax3 = fig_surface.add_subplot(111, projection="3d")
+                surf = ax3.plot_surface(xx, yy, zz, cmap="viridis", edgecolor="none", alpha=0.88)
+                ax3.scatter(d[xfac], d[yfac], d[response], c="black", s=26)
+                ax3.set_xlabel(xfac)
+                ax3.set_ylabel(yfac)
+                ax3.set_zlabel(response)
+                ax3.set_title(f"Response surface for {response}")
+                fig_surface.colorbar(surf, ax=ax3, shrink=0.68, aspect=12)
+                st.pyplot(fig_surface)
+
+                fig_res = residual_plot(model.fittedvalues, model.resid, xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+                st.pyplot(fig_res)
+                fig_qq = qq_plot(model.resid, title="Normal probability plot of DoE residuals")
+                st.pyplot(fig_qq)
+
+                export_results(
+                    prefix="doe_response_surfaces",
+                    report_title="Statistical Analysis Report",
+                    module_name="DoE / Response Surfaces",
+                    statistical_analysis="A design-of-experiments style regression model was fitted to the selected numeric response using the chosen numeric factors. Depending on the selected option, the model included linear terms only, linear plus interactions, or a quadratic response-surface structure. ANOVA, model coefficients, contour plots, surface plots, and residual diagnostics were generated from the fitted model.",
+                    offer_text="This analysis offers a way to quantify factor effects, inspect interactions, model curvature, and visualize the response surface over two selected factors while fixing any remaining factors at chosen values.",
+                    python_tools="Python tools used here include pandas and numpy for selecting factor and response columns, statsmodels for model fitting and ANOVA, matplotlib for contour, 3D surface, and residual diagnostic plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                    table_map={"DoE ANOVA": anova, "Coefficients": coef},
+                    figure_map={
+                        "Contour plot": fig_to_png_bytes(fig_contour),
+                        "Response surface": fig_to_png_bytes(fig_surface),
+                        "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                        "Normal probability plot": fig_to_png_bytes(fig_qq),
+                    },
+                    conclusion="The fitted DoE model can be used to assess influential factors, detect interactions or curvature, and visualize predicted response behavior across the chosen design space.",
+                    decimals=decimals,
+                )
+        except Exception as e:
+            st.error(str(e))
