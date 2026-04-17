@@ -1034,6 +1034,7 @@ if app_selection == "01 - Descriptive Statistics":
 
                         fig = _graphical_summary_figure([ref_stats], f"Graphical Summary: {ref_col}")
                         st.markdown("### Graphical Summary")
+                        fig.tight_layout(pad=1.4)
                         st.pyplot(fig)
                         figs["Graphical Summary"] = fig_to_png_bytes(fig)
                         plt.close(fig)
