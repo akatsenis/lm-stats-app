@@ -182,6 +182,13 @@ def parse_x_values(text):
     return np.array(vals, dtype=float)
 
 
+def parse_optional_float(txt):
+    txt = str(txt).strip()
+    if txt == "":
+        return None
+    return float(txt)
+
+
 def parse_one_col(text):
     df = parse_pasted_table(text, header=False)
     if df is None:
