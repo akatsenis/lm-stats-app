@@ -1171,7 +1171,7 @@ elif app_selection == "02 - Regression Intervals":
             with c9:
                 x_min_txt = st.text_input("X min", value="")
             with c10:
-                default_xmax = str(max(40.0, float(max(data_df["x"].max(), reg_parse_prediction_points(x_pred_text).max()) if len(reg_parse_prediction_points(x_pred_text)) else float(data_df["x"].max()) * 1.15)))
+                default_xmax = str(max(40.0, float(max(data_df["x"].max(), parse_x_values(x_pred_text).max()) if len(parse_x_values(x_pred_text)) else float(data_df["x"].max()) * 1.15)))
                 x_max_txt = st.text_input("X max", value=default_xmax)
             with c11:
                 decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="reg_dec_refined")
@@ -1195,7 +1195,7 @@ elif app_selection == "02 - Regression Intervals":
                 )
 
             if st.button("Run regression analysis", type="primary"):
-                pred_x = reg_parse_prediction_points(x_pred_text)
+                pred_x = parse_x_values(x_pred_text)
                 x_all_max = data_df["x"].max()
                 if len(pred_x) > 0:
                     x_all_max = max(x_all_max, np.max(pred_x))
