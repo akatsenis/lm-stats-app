@@ -835,11 +835,11 @@ if app_selection == "01 - Descriptive Statistics":
             ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
             ax.axvline(sr[0], color="#ef4444", ls=":", lw=1.2)
             ax.axvline(sr[1], color="#ef4444", ls=":", lw=1.2)
-        if shade_label:
+        if shaded_label:
             ax.text(
                 np.mean(sr),
                 4.92,
-                shade_label,
+                shaded_label,
                 ha="center",
                 va="bottom",
                 fontsize=10,
@@ -1112,7 +1112,7 @@ if app_selection == "01 - Descriptive Statistics":
                                     "Acceptance Range": graph_tbl,
                                 }
 
-                                shade_label = f"p > {alpha:.3f} zone around {ref_col} mean"
+                                shaded_label = f"p > {alpha:.3f} zone around {ref_col} mean"
                                 fig = _graphical_summary_figure([ref_stats, test_stats], f"Graphical Summary: {ref_col} vs {test_col}", shaded_range=shaded, shaded_label=shade_label)
                                 st.markdown("### Graphical Summary")
                                 info_box(f"The shaded area is centered on the reference mean and spans the range in which the test mean would remain within the two-sided t-test acceptance zone at α = {alpha:.3f}, using the pooled within-group variance.")
