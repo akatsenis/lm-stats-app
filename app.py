@@ -589,6 +589,22 @@ def tol_interval_normal(x, coverage=0.99, confidence=0.95):
     return mean, mean - k * sd, mean + k * sd
 
 
+def tolerance_interval_normal(data, p=0.95, conf=0.95, two_sided=True):
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    if len(data) < 2:
+        return np.nan, np.nan, np.nan
+    # current app uses only the two-sided version in downstream modules
+    if two_sided:
+        return tol_interval_normal(data, coverage=p, confidence=conf)
+    n = len(data)
+    mean = np.mean(data)
+    sd = np.std(data, ddof=1)
+    zp = norm.ppf(p)
+    k = nct.ppf(conf, n - 1, np.sqrt(n) * zp) / np.sqrt(n)
+    return mean, mean - k * sd, mean + k * sd
+
+
 def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, facecolor=None, plot_key="PCA score plot"):
     if scores.shape[0] < 3:
         return
