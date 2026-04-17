@@ -1113,7 +1113,7 @@ if app_selection == "01 - Descriptive Statistics":
                                 }
 
                                 shaded_label = f"p > {alpha:.3f} zone around {ref_col} mean"
-                                fig = _graphical_summary_figure([ref_stats, test_stats], f"Graphical Summary: {ref_col} vs {test_col}", shaded_range=shaded, shaded_label=shade_label)
+                                fig = _graphical_summary_figure([ref_stats, test_stats], f"Graphical Summary: {ref_col} vs {test_col}", shaded_range=shaded, shaded_label=shaded_label)
                                 st.markdown("### Graphical Summary")
                                 info_box(f"The shaded area is centered on the reference mean and spans the range in which the test mean would remain within the two-sided t-test acceptance zone at α = {alpha:.3f}, using the pooled within-group variance.")
                                 st.pyplot(fig)
