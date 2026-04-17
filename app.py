@@ -1,6 +1,7 @@
 import re
 from io import StringIO, BytesIO
 from textwrap import dedent
+from itertools import product
 
 import streamlit as st
 import pandas as pd
@@ -66,6 +67,7 @@ st.markdown(
 )
 
 
+
 # -------------------------------------------------
 # Global visual controls
 # -------------------------------------------------
@@ -86,19 +88,160 @@ app_selection = st.sidebar.radio(
     ],
 )
 
+PLOT_STYLE_KEYS = [
+    "All graphs",
+    "Descriptive summary",
+    "Regression intervals",
+    "Shelf life",
+    "Dissolution comparison",
+    "Two-sample comparison",
+    "Two-way ANOVA interaction",
+    "PCA score plot",
+    "PCA loading plot",
+    "DoE contour",
+    "Residual plot",
+    "Q-Q plot",
+]
+LINE_STYLE_MAP = {"Solid": "-", "Dash": "--", "Dot": ":", "Dash-dot": "-."}
+DEFAULT_STYLE_CFG = {
+    "fig_w": 8.5,
+    "fig_h": 5.5,
+    "show_legend": True,
+    "legend_loc": "best",
+    "primary_color": "#1f77b4",
+    "secondary_color": "#ff7f0e",
+    "tertiary_color": "#2ca02c",
+    "band_color": "#93c5fd",
+    "grid_alpha": 0.25,
+    "line_style": "-",
+    "aux_line_style": "--",
+    "line_width": 2.0,
+    "aux_line_width": 1.4,
+    "marker_size": 46,
+    "tick_dir": "out",
+    "tick_len": 4,
+    "border_width": 1.0,
+    "show_top": True,
+    "show_right": True,
+    "x_min": None,
+    "x_max": None,
+    "y_min": None,
+    "y_max": None,
+    "arrow_size": 0.03,
+}
+if "plot_style_cfg" not in st.session_state:
+    st.session_state["plot_style_cfg"] = {k: {} for k in PLOT_STYLE_KEYS}
+    st.session_state["plot_style_cfg"]["All graphs"] = DEFAULT_STYLE_CFG.copy()
+
 with st.sidebar.expander("Display & export settings", expanded=False):
-    FIG_W = st.slider("Figure width", 6.0, 14.0, 8.5, 0.5)
-    FIG_H = st.slider("Figure height", 4.0, 10.0, 5.5, 0.5)
-    SHOW_LEGEND = st.checkbox("Show legend", value=True)
-    LEGEND_LOC = st.selectbox("Legend location", ["best", "upper right", "upper left", "lower right", "lower left", "center left", "center right", "lower center", "upper center"], index=0)
-    PRIMARY_COLOR = st.color_picker("Primary color", "#1f77b4")
-    SECONDARY_COLOR = st.color_picker("Secondary color", "#ff7f0e")
-    BAND_COLOR = st.color_picker("Band / area color", "#93c5fd")
-    GRID_ALPHA = st.slider("Grid transparency", 0.0, 1.0, 0.25, 0.05)
     DEFAULT_DECIMALS = st.slider("Default decimals", 1, 8, 3)
 
+    target_graph = st.selectbox("Graph to customize", PLOT_STYLE_KEYS, index=0)
+    base_cfg = DEFAULT_STYLE_CFG.copy()
+    base_cfg.update(st.session_state["plot_style_cfg"].get("All graphs", {}))
+    current_cfg = base_cfg.copy()
+    if target_graph != "All graphs":
+        current_cfg.update(st.session_state["plot_style_cfg"].get(target_graph, {}))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_w = st.slider("Figure width", 5.0, 16.0, float(current_cfg.get("fig_w", 8.5)), 0.5, key=f"{target_graph}_fig_w")
+        show_legend = st.checkbox("Show legend", value=bool(current_cfg.get("show_legend", True)), key=f"{target_graph}_show_legend")
+        primary_color = st.color_picker("Primary color", value=current_cfg.get("primary_color", "#1f77b4"), key=f"{target_graph}_primary")
+        secondary_color = st.color_picker("Secondary color", value=current_cfg.get("secondary_color", "#ff7f0e"), key=f"{target_graph}_secondary")
+        tertiary_color = st.color_picker("Tertiary color", value=current_cfg.get("tertiary_color", "#2ca02c"), key=f"{target_graph}_tertiary")
+        line_width = st.slider("Main line width", 0.5, 4.0, float(current_cfg.get("line_width", 2.0)), 0.1, key=f"{target_graph}_lw")
+        aux_line_width = st.slider("Aux line width", 0.5, 3.0, float(current_cfg.get("aux_line_width", 1.4)), 0.1, key=f"{target_graph}_alw")
+        marker_size = st.slider("Marker size", 10, 150, int(current_cfg.get("marker_size", 46)), 1, key=f"{target_graph}_ms")
+        arrow_size = st.slider("Arrow size", 0.005, 0.20, float(current_cfg.get("arrow_size", 0.03)), 0.005, key=f"{target_graph}_arrow")
+    with c2:
+        fig_h = st.slider("Figure height", 3.0, 12.0, float(current_cfg.get("fig_h", 5.5)), 0.5, key=f"{target_graph}_fig_h")
+        legend_loc = st.selectbox("Legend location", ["best", "upper right", "upper left", "lower right", "lower left", "center left", "center right", "lower center", "upper center"], index=["best", "upper right", "upper left", "lower right", "lower left", "center left", "center right", "lower center", "upper center"].index(current_cfg.get("legend_loc", "best")), key=f"{target_graph}_legend_loc")
+        band_color = st.color_picker("Band / area color", value=current_cfg.get("band_color", "#93c5fd"), key=f"{target_graph}_band")
+        grid_alpha = st.slider("Grid transparency", 0.0, 1.0, float(current_cfg.get("grid_alpha", 0.25)), 0.05, key=f"{target_graph}_ga")
+        line_style_name = st.selectbox("Main line style", list(LINE_STYLE_MAP.keys()), index=list(LINE_STYLE_MAP.values()).index(current_cfg.get("line_style", "-")) if current_cfg.get("line_style", "-") in LINE_STYLE_MAP.values() else 0, key=f"{target_graph}_ls")
+        aux_line_style_name = st.selectbox("Aux line style", list(LINE_STYLE_MAP.keys()), index=list(LINE_STYLE_MAP.values()).index(current_cfg.get("aux_line_style", "--")) if current_cfg.get("aux_line_style", "--") in LINE_STYLE_MAP.values() else 1, key=f"{target_graph}_als")
+        tick_dir = st.selectbox("Tick direction", ["out", "in", "inout"], index=["out", "in", "inout"].index(current_cfg.get("tick_dir", "out")), key=f"{target_graph}_tick_dir")
+        tick_len = st.slider("Tick length", 0, 12, int(current_cfg.get("tick_len", 4)), 1, key=f"{target_graph}_tick_len")
+        border_width = st.slider("Border width", 0.5, 3.0, float(current_cfg.get("border_width", 1.0)), 0.1, key=f"{target_graph}_bw")
+        show_top = st.checkbox("Show top border", value=bool(current_cfg.get("show_top", True)), key=f"{target_graph}_top")
+        show_right = st.checkbox("Show right border", value=bool(current_cfg.get("show_right", True)), key=f"{target_graph}_right")
+
+    st.markdown("**Axis limits (leave blank for automatic)**")
+    x1, x2, y1, y2 = st.columns(4)
+    x_min_cfg = x1.text_input("X min", value="" if current_cfg.get("x_min", None) in [None, ""] else str(current_cfg.get("x_min")), key=f"{target_graph}_xmin")
+    x_max_cfg = x2.text_input("X max", value="" if current_cfg.get("x_max", None) in [None, ""] else str(current_cfg.get("x_max")), key=f"{target_graph}_xmax")
+    y_min_cfg = y1.text_input("Y min", value="" if current_cfg.get("y_min", None) in [None, ""] else str(current_cfg.get("y_min")), key=f"{target_graph}_ymin")
+    y_max_cfg = y2.text_input("Y max", value="" if current_cfg.get("y_max", None) in [None, ""] else str(current_cfg.get("y_max")), key=f"{target_graph}_ymax")
+
+    st.session_state["plot_style_cfg"][target_graph] = {
+        "fig_w": fig_w,
+        "fig_h": fig_h,
+        "show_legend": show_legend,
+        "legend_loc": legend_loc,
+        "primary_color": primary_color,
+        "secondary_color": secondary_color,
+        "tertiary_color": tertiary_color,
+        "band_color": band_color,
+        "grid_alpha": grid_alpha,
+        "line_style": LINE_STYLE_MAP[line_style_name],
+        "aux_line_style": LINE_STYLE_MAP[aux_line_style_name],
+        "line_width": line_width,
+        "aux_line_width": aux_line_width,
+        "marker_size": marker_size,
+        "tick_dir": tick_dir,
+        "tick_len": tick_len,
+        "border_width": border_width,
+        "show_top": show_top,
+        "show_right": show_right,
+        "x_min": x_min_cfg.strip() if isinstance(x_min_cfg, str) else x_min_cfg,
+        "x_max": x_max_cfg.strip() if isinstance(x_max_cfg, str) else x_max_cfg,
+        "y_min": y_min_cfg.strip() if isinstance(y_min_cfg, str) else y_min_cfg,
+        "y_max": y_max_cfg.strip() if isinstance(y_max_cfg, str) else y_max_cfg,
+        "arrow_size": arrow_size,
+    }
+
+    if st.button("Reset selected graph style", key="reset_graph_style"):
+        st.session_state["plot_style_cfg"][target_graph] = {} if target_graph != "All graphs" else DEFAULT_STYLE_CFG.copy()
+        st.rerun()
+
+def _parse_style_float(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    s = str(val).strip()
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def get_plot_cfg(plot_key="All graphs"):
+    cfg = DEFAULT_STYLE_CFG.copy()
+    cfg.update(st.session_state.get("plot_style_cfg", {}).get("All graphs", {}))
+    if plot_key and plot_key != "All graphs":
+        specific = st.session_state.get("plot_style_cfg", {}).get(plot_key, {})
+        cfg.update({k: v for k, v in specific.items() if v not in [None, ""]})
+    cfg["x_min"] = _parse_style_float(cfg.get("x_min"))
+    cfg["x_max"] = _parse_style_float(cfg.get("x_max"))
+    cfg["y_min"] = _parse_style_float(cfg.get("y_min"))
+    cfg["y_max"] = _parse_style_float(cfg.get("y_max"))
+    return cfg
+
+_ALL_CFG = get_plot_cfg("All graphs")
+FIG_W = _ALL_CFG["fig_w"]
+FIG_H = _ALL_CFG["fig_h"]
+SHOW_LEGEND = _ALL_CFG["show_legend"]
+LEGEND_LOC = _ALL_CFG["legend_loc"]
+PRIMARY_COLOR = _ALL_CFG["primary_color"]
+SECONDARY_COLOR = _ALL_CFG["secondary_color"]
+BAND_COLOR = _ALL_CFG["band_color"]
+GRID_ALPHA = _ALL_CFG["grid_alpha"]
+
 st.sidebar.divider()
-st.sidebar.info("Paste data from Excel. Tables, charts, Excel exports, and PDF-style reports are built into the app.")
+st.sidebar.info("Paste data from Excel. Tables, charts, Excel exports, and PDF-style reports are built into the app. Exported figures keep the current display settings.")
 
 
 # -------------------------------------------------
@@ -380,318 +523,112 @@ def export_results(prefix, report_title, module_name, statistical_analysis, offe
 # -------------------------------------------------
 # Plot helpers
 # -------------------------------------------------
-def apply_ax_style(ax, title, xlabel, ylabel, legend=None):
+
+def apply_ax_style(ax, title, xlabel, ylabel, legend=None, plot_key="All graphs"):
+    cfg = get_plot_cfg(plot_key)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.grid(alpha=GRID_ALPHA)
-    if SHOW_LEGEND and legend:
-        ax.legend(frameon=False, loc=LEGEND_LOC)
+    ax.grid(alpha=cfg["grid_alpha"])
+    ax.tick_params(direction=cfg["tick_dir"], length=cfg["tick_len"], width=cfg["border_width"])
+    ax.spines["left"].set_linewidth(cfg["border_width"])
+    ax.spines["bottom"].set_linewidth(cfg["border_width"])
+    ax.spines["top"].set_linewidth(cfg["border_width"])
+    ax.spines["right"].set_linewidth(cfg["border_width"])
+    ax.spines["top"].set_visible(cfg["show_top"])
+    ax.spines["right"].set_visible(cfg["show_right"])
+    if cfg["x_min"] is not None or cfg["x_max"] is not None:
+        ax.set_xlim(left=cfg["x_min"], right=cfg["x_max"])
+    if cfg["y_min"] is not None or cfg["y_max"] is not None:
+        ax.set_ylim(bottom=cfg["y_min"], top=cfg["y_max"])
+    if legend is None:
+        legend = cfg["show_legend"]
+    if cfg["show_legend"] and legend:
+        ax.legend(frameon=False, loc=cfg["legend_loc"])
 
 
 def residual_plot(fitted, residuals, xlabel="Fitted", ylabel="Residuals", title="Residuals vs fitted"):
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-    ax.scatter(fitted, residuals, color=PRIMARY_COLOR, s=42)
-    ax.axhline(0, color="#111827", lw=1.3, ls="--")
-    apply_ax_style(ax, title, xlabel, ylabel)
+    cfg = get_plot_cfg("Residual plot")
+    fig, ax = plt.subplots(figsize=(cfg["fig_w"], cfg["fig_h"]))
+    ax.scatter(fitted, residuals, color=cfg["primary_color"], s=cfg["marker_size"])
+    ax.axhline(0, color="#111827", ls=cfg["aux_line_style"], lw=cfg["aux_line_width"])
+    apply_ax_style(ax, title, xlabel, ylabel, plot_key="Residual plot")
     return fig
 
 
 def qq_plot(residuals, title="Normal probability plot of residuals"):
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    cfg = get_plot_cfg("Q-Q plot")
+    fig, ax = plt.subplots(figsize=(cfg["fig_w"], cfg["fig_h"]))
     stats.probplot(residuals, dist="norm", plot=ax)
-    ax.get_lines()[0].set_markerfacecolor(PRIMARY_COLOR)
-    ax.get_lines()[0].set_markeredgecolor(PRIMARY_COLOR)
-    ax.get_lines()[1].set_color(SECONDARY_COLOR)
-    apply_ax_style(ax, title, "Theoretical quantiles", "Ordered residuals")
+    if len(ax.lines) >= 2:
+        ax.lines[0].set_marker("o")
+        ax.lines[0].set_linestyle("None")
+        ax.lines[0].set_color(cfg["primary_color"])
+        ax.lines[0].set_markersize(max(3, cfg["marker_size"] / 12))
+        ax.lines[1].set_color(cfg["secondary_color"])
+        ax.lines[1].set_linestyle(cfg["aux_line_style"])
+        ax.lines[1].set_linewidth(cfg["aux_line_width"])
+    apply_ax_style(ax, title, "Theoretical quantiles", "Ordered residuals", plot_key="Q-Q plot")
     return fig
 
 
-# -------------------------------------------------
-# Statistical helpers
-# -------------------------------------------------
-def fit_linear(x, y):
+def tol_interval_normal(x, coverage=0.99, confidence=0.95):
     x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    x = x[np.isfinite(x)]
     n = len(x)
-    X = np.column_stack([np.ones(n), x])
-    XtX_inv = np.linalg.inv(X.T @ X)
-    beta = XtX_inv @ X.T @ y
-    intercept, slope = beta
-    fitted = X @ beta
-    resid = y - fitted
-    df = n - 2
-    s = np.sqrt(np.sum(resid**2) / df)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    ss_res = np.sum(resid**2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return {"intercept": intercept, "slope": slope, "XtX_inv": XtX_inv, "fitted": fitted, "resid": resid, "df": df, "s": s, "r2": r2}
-
-
-def predict_intervals(model, x_vals, alpha=0.05):
-    x_vals = np.asarray(x_vals, dtype=float)
-    X0 = np.column_stack([np.ones(len(x_vals)), x_vals])
-    fit = model["intercept"] + model["slope"] * x_vals
-    h = np.sum((X0 @ model["XtX_inv"]) * X0, axis=1)
-    tcrit = t.ppf(1 - alpha / 2, model["df"])
-    se_mean = model["s"] * np.sqrt(h)
-    se_pred = model["s"] * np.sqrt(1 + h)
-    return pd.DataFrame({
-        "X": x_vals,
-        "Fitted": fit,
-        "Lower CI": fit - tcrit * se_mean,
-        "Upper CI": fit + tcrit * se_mean,
-        "Lower PI": fit - tcrit * se_pred,
-        "Upper PI": fit + tcrit * se_pred,
-    })
-
-
-def reg_parse_prediction_points(text):
-    text = str(text).strip()
-    if not text:
-        return np.array([], dtype=float)
-    parts = re.split(r"[\s,\t;]+", text)
-    vals = []
-    for p in parts:
-        p = p.strip()
-        if p:
-            vals.append(float(p))
-    return np.array(vals, dtype=float)
-
-
-def reg_fit_linear_model(x, y):
-    x = np.asarray(x, dtype=float).ravel()
-    y = np.asarray(y, dtype=float).ravel()
-    n = len(x)
-    X = np.column_stack([np.ones(n), x])
-    XtX_inv = np.linalg.inv(X.T @ X)
-    beta = XtX_inv @ (X.T @ y)
-    intercept, slope = beta
-    y_fit = X @ beta
-    resid = y - y_fit
-    df = n - 2
-    s = np.sqrt(np.sum(resid**2) / df)
-    ss_tot = np.sum((y - np.mean(y))**2)
-    ss_res = np.sum(resid**2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return {
-        "intercept": intercept,
-        "slope": slope,
-        "XtX_inv": XtX_inv,
-        "s": s,
-        "df": df,
-        "r2": r2,
-        "x": x,
-        "y": y,
-        "y_fit": y_fit,
-        "fitted": y_fit,
-        "resid": resid,
-    }
-
-
-def reg_predict_with_intervals(model, x_values, confidence=0.95, side="upper"):
-    x_values = np.asarray(x_values, dtype=float).ravel()
-    Xg = np.column_stack([np.ones(len(x_values)), x_values])
-    beta = np.array([model["intercept"], model["slope"]])
-    yhat = Xg @ beta
-    h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
-    se_mean = model["s"] * np.sqrt(h)
-    se_pred = model["s"] * np.sqrt(1 + h)
-    alpha = 1 - confidence
-    if side == "two-sided":
-        tcrit = t.ppf(1 - alpha / 2, model["df"])
-    else:
-        tcrit = t.ppf(confidence, model["df"])
-    ci_lower = yhat - tcrit * se_mean
-    ci_upper = yhat + tcrit * se_mean
-    pi_lower = yhat - tcrit * se_pred
-    pi_upper = yhat + tcrit * se_pred
-    return pd.DataFrame({
-        "x": x_values,
-        "fit": yhat,
-        "ci_lower": ci_lower,
-        "ci_upper": ci_upper,
-        "pi_lower": pi_lower,
-        "pi_upper": pi_upper,
-    })
-
-
-def reg_find_crossing(xv, yv, limit):
-    d = yv - limit
-    idx = np.where(d[:-1] * d[1:] <= 0)[0]
-    if len(idx) == 0:
-        return None
-    i = idx[0]
-    x1, x2 = xv[i], xv[i + 1]
-    y1, y2 = yv[i], yv[i + 1]
-    if y2 == y1:
-        return x1
-    return x1 + (limit - y1) * (x2 - x1) / (y2 - y1)
-
-
-def plot_regression_advanced(
-    data_df,
-    model,
-    grid_df,
-    confidence=0.95,
-    interval="pi",
-    side="upper",
-    title="",
-    xlabel="Time",
-    ylabel="Response",
-    point_label="Data",
-    y_suffix="%",
-    spec_enabled=False,
-    spec_limit=None,
-    spec_label="US",
-    crossing_on="auto",
-):
-    x = data_df["x"].to_numpy()
-    y = data_df["y"].to_numpy()
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-    ax.scatter(x, y, color=PRIMARY_COLOR, s=50, alpha=0.85, label=point_label, zorder=3)
-    ax.plot(grid_df["x"], grid_df["fit"], color="#2c3e50", lw=2, label="Fitted Line")
-
-    if interval in ["ci", "both"]:
-        if side == "two-sided":
-            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Confidence Interval (CI)")
-            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.2)
-            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.2)
-        elif side == "upper":
-            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Upper CI")
-            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
-        else:
-            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=BAND_COLOR, alpha=0.20, label="Lower CI")
-            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
-
-    if interval in ["pi", "both"]:
-        if side == "two-sided":
-            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Prediction Interval (PI)")
-            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
-            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
-        elif side == "upper":
-            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Upper PI")
-            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
-        else:
-            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=SECONDARY_COLOR, alpha=0.13, label="Lower PI")
-            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
-
-    crossing_x = None
-    if spec_enabled and spec_limit is not None:
-        ax.axhline(spec_limit, color="#27ae60", ls="--", lw=1.5, label=f"Limit ({spec_label})")
-        curve_map = {
-            "fit": grid_df["fit"].to_numpy(),
-            "ci_upper": grid_df["ci_upper"].to_numpy(),
-            "ci_lower": grid_df["ci_lower"].to_numpy(),
-            "pi_upper": grid_df["pi_upper"].to_numpy(),
-            "pi_lower": grid_df["pi_lower"].to_numpy(),
-        }
-        if crossing_on == "auto":
-            if interval in ["both", "pi"]:
-                crossing_on = "pi_upper" if side == "upper" else "pi_lower" if side == "lower" else "pi_upper"
-            else:
-                crossing_on = "ci_upper" if side == "upper" else "ci_lower" if side == "lower" else "ci_upper"
-        if crossing_on in curve_map:
-            crossing_x = reg_find_crossing(grid_df["x"].to_numpy(), curve_map[crossing_on], spec_limit)
-            if crossing_x is not None:
-                ax.axvline(crossing_x, color="#27ae60", ls=":", lw=1.5)
-                ymin, ymax = ax.get_ylim()
-                ax.text(
-                    crossing_x,
-                    ymin + 0.05 * (ymax - ymin),
-                    f" {crossing_x:.2f}",
-                    color="#27ae60",
-                    ha="left",
-                    va="bottom",
-                    fontsize=11,
-                    weight="bold",
-                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
-                )
-        xmin = grid_df["x"].min()
-        xmax = grid_df["x"].max()
-        ymax_data = max(grid_df["fit"].max(), grid_df["ci_upper"].max(), grid_df["pi_upper"].max(), y.max())
-        ymin_data = min(grid_df["fit"].min(), grid_df["ci_lower"].min(), grid_df["pi_lower"].min(), y.min())
-        pad = 0.02 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
-        suffix = y_suffix or ""
-        ax.text(
-            xmin + (xmax - xmin) * 0.02,
-            spec_limit + pad,
-            f"{spec_label} = {spec_limit:.1f}{suffix}",
-            ha="left",
-            va="bottom",
-            fontsize=11,
-            color="#27ae60",
-            weight="bold",
-            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=3),
-        )
-
-    if y_suffix:
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
-
-    if not str(title).strip():
-        s1 = {"upper": "Upper One-Sided", "lower": "Lower One-Sided", "two-sided": "Two-Sided"}[side]
-        s2 = {"ci": "Confidence Intervals", "pi": "Prediction Intervals", "both": "Confidence and Prediction Intervals"}[interval]
-        title = f"{s1} {s2} ({confidence:.0%})"
-
-    ax.set_title(title, pad=12)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(alpha=GRID_ALPHA)
-    if SHOW_LEGEND:
-        ax.legend(frameon=False, loc=LEGEND_LOC)
-    fig.tight_layout()
-    return fig, crossing_x
-
-
-def estimate_shelf_life(model, limit, decreasing=True, confidence=0.95, x_upper=100):
-    xg = np.linspace(0, x_upper, 1500)
-    X0 = np.column_stack([np.ones(len(xg)), xg])
-    fit = model["intercept"] + model["slope"] * xg
-    h = np.sum((X0 @ model["XtX_inv"]) * X0, axis=1)
-    tcrit = t.ppf(confidence, model["df"])  # one-sided
-    band = fit - tcrit * model["s"] * np.sqrt(h) if decreasing else fit + tcrit * model["s"] * np.sqrt(h)
-    idx = np.where(band <= limit)[0] if decreasing else np.where(band >= limit)[0]
-    shelf = float(xg[idx[0]]) if len(idx) else np.nan
-    return shelf, xg, fit, band
-
-
-def tolerance_interval_normal(data, p=0.95, conf=0.95, two_sided=True):
-    data = np.asarray(data, dtype=float)
-    n = len(data)
-    mean = data.mean()
-    sd = data.std(ddof=1)
     if n < 2:
         return np.nan, np.nan, np.nan
-    if two_sided:
-        g = norm.ppf((1 + p) / 2)
-        k = g * np.sqrt((n - 1) * (1 + 1 / n) / chi2.ppf(1 - conf, n - 1))
-        return mean, mean - k * sd, mean + k * sd
-    zp = norm.ppf(p)
-    k = nct.ppf(conf, n - 1, np.sqrt(n) * zp) / np.sqrt(n)
+    mean = np.mean(x)
+    sd = np.std(x, ddof=1)
+    nu = n - 1
+    z_p = norm.ppf((1 + coverage) / 2)
+    chi = stats.chi2.ppf(confidence, nu)
+    if chi <= 0:
+        return mean, np.nan, np.nan
+    k = z_p * np.sqrt(nu * (1 + 1 / n) / chi)
     return mean, mean - k * sd, mean + k * sd
 
 
-def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, alpha=0.14, lw=1.25):
+def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, facecolor=None, plot_key="PCA score plot"):
     if scores.shape[0] < 3:
         return
-    cov = np.cov(scores[:, 0], scores[:, 1])
-    if not np.all(np.isfinite(cov)):
-        return
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    if np.any(eigvals <= 0):
-        return
-    order = eigvals.argsort()[::-1]
-    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
-    angle = np.degrees(np.arctan2(*eigvecs[:, 0][::-1]))
-    width, height = 2 * np.sqrt(5.991 * eigvals)  # ~95% confidence ellipse
+    cov = np.cov(scores.T)
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    theta = np.degrees(np.arctan2(*vecs[:, 0][::-1]))
+    q = stats.chi2.ppf(0.95, 2)
+    width, height = 2 * np.sqrt(vals * q)
+    cfg = get_plot_cfg(plot_key)
+    lw = cfg["aux_line_width"]
+    ls = cfg["aux_line_style"]
+    fc = facecolor if facecolor is not None else edgecolor
     ell = Ellipse(
-        scores.mean(axis=0), width, height, angle=angle,
-        facecolor=edgecolor, edgecolor=edgecolor, alpha=alpha, lw=lw
+        xy=np.mean(scores, axis=0),
+        width=width,
+        height=height,
+        angle=theta,
+        edgecolor=edgecolor,
+        facecolor=fc,
+        alpha=0.15,
+        lw=lw,
+        ls=ls,
     )
     ax.add_patch(ell)
 
+    if scores.shape[0] < 3:
+        return
+    cov = np.cov(scores[:, 0], scores[:, 1])
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = eigvals.argsort()[::-1]
+    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
+    angle = np.degrees(np.arctan2(*eigvecs[:, 0][::-1]))
+    width, height = 2 * np.sqrt(5.991 * eigvals)
+    ell = Ellipse(scores.mean(axis=0), width, height, angle=angle, fill=False, lw=2, edgecolor=edgecolor)
+    ax.add_patch(ell)
 
-def doe_formula(safe_factors, model_type="interaction", include_block=False):
+
+def doe_formula(safe_factors, model_type="interaction"):
     terms = list(safe_factors)
     if model_type in ["interaction", "quadratic"]:
         for i in range(len(safe_factors)):
@@ -700,61 +637,7 @@ def doe_formula(safe_factors, model_type="interaction", include_block=False):
     if model_type == "quadratic":
         for f in safe_factors:
             terms.append(f"I({f}**2)")
-    if include_block:
-        terms = ["C(Block)"] + terms
     return "Response ~ " + " + ".join(terms)
-
-
-def generate_full_factorial_design(factor_info, n_blocks=1, center_points_per_block=0, replicates=1, randomize=True, seed=123):
-    import itertools
-    coded_rows = list(itertools.product([-1, 1], repeat=len(factor_info)))
-    rows = []
-    std_order = 1
-    for rep in range(replicates):
-        for idx, coded in enumerate(coded_rows):
-            row = {"StdOrder": std_order}
-            for (name, low, high), code in zip(factor_info, coded):
-                row[name] = low if code == -1 else high
-                row[f"{name} (coded)"] = code
-            rows.append(row)
-            std_order += 1
-
-    if n_blocks < 1:
-        n_blocks = 1
-
-    # Assign factorial runs to blocks as evenly as possible
-    for i, row in enumerate(rows):
-        row["Block"] = (i % n_blocks) + 1
-
-    # Add center points to each block
-    for b in range(1, n_blocks + 1):
-        for _ in range(center_points_per_block):
-            row = {"StdOrder": std_order, "Block": b}
-            for name, low, high in factor_info:
-                row[name] = (low + high) / 2
-                row[f"{name} (coded)"] = 0
-            rows.append(row)
-            std_order += 1
-
-    df = pd.DataFrame(rows)
-
-    if randomize:
-        rng = np.random.default_rng(seed)
-        randomized = []
-        run_no = 1
-        for b in sorted(df["Block"].unique()):
-            sub = df[df["Block"] == b].copy()
-            order = rng.permutation(len(sub))
-            sub = sub.iloc[order].reset_index(drop=True)
-            sub["Run"] = range(run_no, run_no + len(sub))
-            run_no += len(sub)
-            randomized.append(sub)
-        df = pd.concat(randomized, ignore_index=True)
-    else:
-        df["Run"] = range(1, len(df) + 1)
-
-    cols = ["Run", "StdOrder", "Block"] + [f[0] for f in factor_info] + [f"{f[0]} (coded)" for f in factor_info]
-    return df[cols]
 
 
 # -------------------------------------------------
@@ -869,12 +752,16 @@ if app_selection == "01 - Descriptive Statistics":
         tcrit = t.ppf(1 - alpha_level / 2, n1 + n2 - 2)
         return m1 - tcrit * se_diff, m1 + tcrit * se_diff
 
+    
     def _graphical_summary_figure(stats_list, title, shaded_range=None, shaded_label=None):
-        colors = ["#d62728", "#111111"] if len(stats_list) > 1 else [PRIMARY_COLOR]
+        cfg = get_plot_cfg("Descriptive summary")
+        if len(stats_list) > 1:
+            colors = [cfg["primary_color"], cfg["secondary_color"], cfg["tertiary_color"]]
+        else:
+            colors = [cfg["primary_color"]]
         labels = [s["label"] for s in stats_list]
 
-        mins = []
-        maxs = []
+        mins, maxs = [], []
         for s in stats_list:
             for key in ["min", "whisker_lower", "q1", "mean", "tol_lower", "ci_lower"]:
                 if pd.notna(s.get(key, np.nan)):
@@ -900,10 +787,14 @@ if app_selection == "01 - Descriptive Statistics":
         pad = 0.08 * (x_max - x_min if x_max > x_min else 1)
         x_lo, x_hi = x_min - pad, x_max + pad
 
-        fig, (ax, axr) = plt.subplots(1, 2, figsize=(max(FIG_W * 1.95, 13), max(FIG_H * 1.55, 7.5)), gridspec_kw={"width_ratios": [1.6, 1]})
+        fig, (ax, axr) = plt.subplots(
+            1, 2,
+            figsize=(max(cfg["fig_w"] * 1.95, 13), max(cfg["fig_h"] * 1.55, 7.2)),
+            gridspec_kw={"width_ratios": [1.6, 1]}
+        )
 
-        density_y0 = 6.0
-        row_centers = [5.15, 4.30, 3.45, 2.60, 1.75, 0.90]
+        density_y0 = 6.35
+        row_centers = [5.25, 4.35, 3.45, 2.55, 1.65, 0.75]
         row_names = [
             "Whisker Min/Max",
             "Min/Max",
@@ -914,13 +805,22 @@ if app_selection == "01 - Descriptive Statistics":
         ]
 
         if sr is not None:
-            ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
-            ax.axvline(sr[0], color="#ef4444", ls=":", lw=1.2)
-            ax.axvline(sr[1], color="#ef4444", ls=":", lw=1.2)
+            ax.axvspan(sr[0], sr[1], color=cfg["band_color"], alpha=0.18)
+            ax.axvline(sr[0], color=cfg["secondary_color"], ls=cfg["aux_line_style"], lw=cfg["aux_line_width"])
+            ax.axvline(sr[1], color=cfg["secondary_color"], ls=cfg["aux_line_style"], lw=cfg["aux_line_width"])
             if shaded_label:
-                ax.text(float(np.mean(sr)), 6.25, shaded_label, color="#b91c1c", ha="center", va="bottom", fontsize=9, bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2))
+                ax.text(
+                    float(np.mean(sr)),
+                    6.55,
+                    shaded_label,
+                    color=cfg["secondary_color"],
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2),
+                )
 
-        xgrid = np.linspace(x_lo, x_hi, 500)
+        xgrid = np.linspace(x_lo, x_hi, 600)
         for i, s in enumerate(stats_list):
             arr = s["raw"]
             col = colors[i]
@@ -932,7 +832,7 @@ if app_selection == "01 - Descriptive Statistics":
                     dens = np.zeros_like(xgrid)
             else:
                 dens = np.zeros_like(xgrid)
-            ax.plot(xgrid, density_y0 + dens, color=col, lw=2)
+            ax.plot(xgrid, density_y0 + dens, color=col, lw=cfg["line_width"], ls=cfg["line_style"])
             ax.hlines(density_y0, x_lo, x_hi, color="#111827", lw=0.8)
 
         offsets = [0.10, -0.10] if len(stats_list) > 1 else [0.0]
@@ -941,99 +841,99 @@ if app_selection == "01 - Descriptive Statistics":
             for i, s in enumerate(stats_list):
                 yy = yc + offsets[i]
                 col = colors[i]
+                ms = max(4, cfg["marker_size"] / 12)
                 if ridx == 0:
-                    ax.hlines(yy, s["whisker_lower"], s["whisker_upper"], color=col, lw=1.8)
-                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                    ax.hlines(yy, s["whisker_lower"], s["whisker_upper"], color=col, lw=cfg["line_width"], ls=cfg["line_style"])
+                    ax.plot(s["median"], yy, 'o', color=col, ms=ms)
                 elif ridx == 1:
-                    ax.hlines(yy, s["min"], s["max"], color=col, lw=1.6)
-                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                    ax.hlines(yy, s["min"], s["max"], color=col, lw=cfg["line_width"], ls=cfg["line_style"])
+                    ax.plot(s["median"], yy, 'o', color=col, ms=ms)
                 elif ridx == 2:
                     lo = s["mean"] - 3 * s["sd"] if pd.notna(s["sd"]) else np.nan
                     hi = s["mean"] + 3 * s["sd"] if pd.notna(s["sd"]) else np.nan
                     if pd.notna(lo) and pd.notna(hi):
-                        ax.hlines(yy, lo, hi, color=col, lw=1.8)
-                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                        ax.hlines(yy, lo, hi, color=col, lw=cfg["line_width"], ls=cfg["line_style"])
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=max(4.5, cfg["marker_size"] / 10))
                 elif ridx == 3:
-                    ax.hlines(yy, s["q1"], s["q3"], color=col, lw=2.0)
-                    ax.plot(s["median"], yy, 'o', color=col, ms=5)
+                    ax.hlines(yy, s["q1"], s["q3"], color=col, lw=cfg["line_width"] + 0.2, ls=cfg["line_style"])
+                    ax.plot(s["median"], yy, 'o', color=col, ms=ms)
                 elif ridx == 4:
-                    ax.hlines(yy, s["tol_lower"], s["tol_upper"], color=col, lw=1.9)
-                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                    ax.hlines(yy, s["tol_lower"], s["tol_upper"], color=col, lw=cfg["line_width"], ls=cfg["line_style"])
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=max(4.5, cfg["marker_size"] / 10))
                 elif ridx == 5:
-                    ax.hlines(yy, s["ci_lower"], s["ci_upper"], color=col, lw=1.9)
-                    ax.plot(s["mean"], yy, 'o', color=col, ms=6)
+                    ax.hlines(yy, s["ci_lower"], s["ci_upper"], color=col, lw=cfg["line_width"], ls=cfg["line_style"])
+                    ax.plot(s["mean"], yy, 'o', color=col, ms=max(4.5, cfg["marker_size"] / 10))
 
         ax.set_xlim(x_lo, x_hi)
-        ax.set_ylim(0.4, 6.6)
+        ax.set_ylim(0.35, 6.95)
         ax.set_yticks([density_y0] + row_centers)
         ax.set_yticklabels(["Normal distribution"] + row_names)
-        ax.set_title(title)
-        ax.grid(axis="x", alpha=GRID_ALPHA)
-        if SHOW_LEGEND:
-            handles = [plt.Line2D([0], [0], color=colors[i], marker='o', lw=2, label=labels[i]) for i in range(len(labels))]
-            ax.legend(handles=handles, frameon=False, loc=LEGEND_LOC)
+        apply_ax_style(ax, title, "", "", legend=False, plot_key="Descriptive summary")
+        ax.grid(axis="x", alpha=cfg["grid_alpha"])
+
+        if cfg["show_legend"] and len(labels) > 1:
+            handles = [plt.Line2D([0], [0], color=colors[i], marker='o', lw=cfg["line_width"], ls=cfg["line_style"], label=labels[i]) for i in range(len(labels))]
+            ax.legend(handles=handles, frameon=False, loc=cfg["legend_loc"])
 
         axr.axis("off")
-        axr.set_title("Graphical Summary with Descriptive Statistics", fontsize=11, fontweight="bold", pad=10)
+        axr.set_title("Graphical Summary with Descriptive Statistics", fontsize=13, weight="bold", pad=10)
+
+        rows = []
         if len(stats_list) == 1:
             s = stats_list[0]
             rows = [
-                ("Normality (AD), p-value", fmt_p(s["ad_p"])),
-                ("Normality (Shapiro), p-value", fmt_p(s["shapiro_p"])),
-                ("Mean", s["mean"]),
-                ("SD", s["sd"]),
-                ("N", s["n"]),
-                ("Variance", s["var"]),
-                ("Minimum", s["min"]),
-                ("1st Quartile", s["q1"]),
-                ("Median", s["median"]),
-                ("3rd Quartile", s["q3"]),
-                ("Maximum", s["max"]),
-                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s["tol_lower"]),
-                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s["tol_upper"]),
-                (f"{mean_ci_conf}% LCI for Mean", s["ci_lower"]),
-                (f"{mean_ci_conf}% UCI for Mean", s["ci_upper"]),
+                ["Normality (AD), p-value", f"{s['ad_p']:.3f}" if pd.notna(s['ad_p']) else "-"],
+                ["Normality (Shapiro), p-value", f"{s['shapiro_p']:.3f}" if pd.notna(s['shapiro_p']) else "-"],
+                ["Mean", f"{s['mean']:.3f}"],
+                ["SD", f"{s['sd']:.3f}"],
+                ["N", f"{s['n']:.0f}"],
+                ["Variance", f"{s['var']:.3f}"],
+                ["Minimum", f"{s['min']:.3f}"],
+                ["1st Quartile", f"{s['q1']:.3f}"],
+                ["Median", f"{s['median']:.3f}"],
+                ["3rd Quartile", f"{s['q3']:.3f}"],
+                ["Maximum", f"{s['max']:.3f}"],
+                [f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", f"{s['tol_lower']:.3f}"],
+                [f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", f"{s['tol_upper']:.3f}"],
+                [f"{mean_ci_conf}% LCI for Mean", f"{s['ci_lower']:.3f}"],
+                [f"{mean_ci_conf}% UCI for Mean", f"{s['ci_upper']:.3f}"],
             ]
-            axr.text(0.60, 0.96, s["label"], ha="center", va="top", fontsize=10, fontweight="bold")
-            y = 0.90
-            for name, val in rows:
-                axr.text(0.03, y, name, ha="left", va="center", fontsize=9, fontweight="bold")
-                if isinstance(val, str):
-                    show = val
-                else:
-                    show = "-" if pd.isna(val) else f"{val:.3f}"
-                axr.text(0.83, y, show, ha="center", va="center", fontsize=9)
-                y -= 0.055
+            x0, x1 = 0.02, 0.84
+            y = 0.94
+            axr.text(0.65, 0.98, s["label"], ha="center", va="top", fontsize=12, weight="bold")
+            for label, val in rows:
+                axr.text(x0, y, label, ha="left", va="center", fontsize=10.5, weight="bold")
+                axr.text(x1, y, val, ha="right", va="center", fontsize=10.5)
+                y -= 0.06
         else:
-            s1, s2 = stats_list[0], stats_list[1]
+            s1, s2 = stats_list[:2]
+            x0, x1, x2 = 0.02, 0.72, 0.95
+            y = 0.94
+            axr.text(x1, 0.98, s1["label"], ha="center", va="top", fontsize=12, weight="bold")
+            axr.text(x2, 0.98, s2["label"], ha="center", va="top", fontsize=12, weight="bold")
             rows = [
-                ("Normality (AD), p-value", fmt_p(s1["ad_p"]), fmt_p(s2["ad_p"])),
-                ("Mean", s1["mean"], s2["mean"]),
-                ("SD", s1["sd"], s2["sd"]),
-                ("N", s1["n"], s2["n"]),
-                ("Variance", s1["var"], s2["var"]),
-                ("Minimum", s1["min"], s2["min"]),
-                ("1st Quartile", s1["q1"], s2["q1"]),
-                ("Median", s1["median"], s2["median"]),
-                ("3rd Quartile", s1["q3"], s2["q3"]),
-                ("Maximum", s1["max"], s2["max"]),
-                (f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", s1["tol_lower"], s2["tol_lower"]),
-                (f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", s1["tol_upper"], s2["tol_upper"]),
-                (f"{mean_ci_conf}% LCI for Mean", s1["ci_lower"], s2["ci_lower"]),
-                (f"{mean_ci_conf}% UCI for Mean", s1["ci_upper"], s2["ci_upper"]),
+                ["Normality (AD), p-value", f"{s1['ad_p']:.3f}" if pd.notna(s1['ad_p']) else "-", f"{s2['ad_p']:.3f}" if pd.notna(s2['ad_p']) else "-"],
+                ["Mean", f"{s1['mean']:.3f}", f"{s2['mean']:.3f}"],
+                ["SD", f"{s1['sd']:.3f}", f"{s2['sd']:.3f}"],
+                ["N", f"{s1['n']:.3f}", f"{s2['n']:.3f}"],
+                ["Variance", f"{s1['var']:.3f}", f"{s2['var']:.3f}"],
+                ["Minimum", f"{s1['min']:.3f}", f"{s2['min']:.3f}"],
+                ["1st Quartile", f"{s1['q1']:.3f}", f"{s2['q1']:.3f}"],
+                ["Median", f"{s1['median']:.3f}", f"{s2['median']:.3f}"],
+                ["3rd Quartile", f"{s1['q3']:.3f}", f"{s2['q3']:.3f}"],
+                ["Maximum", f"{s1['max']:.3f}", f"{s2['max']:.3f}"],
+                [f"{tol_cov}%/{tol_conf}% Tol. Int. Lower", f"{s1['tol_lower']:.3f}", f"{s2['tol_lower']:.3f}"],
+                [f"{tol_cov}%/{tol_conf}% Tol. Int. Upper", f"{s1['tol_upper']:.3f}", f"{s2['tol_upper']:.3f}"],
+                [f"{mean_ci_conf}% LCI for Mean", f"{s1['ci_lower']:.3f}", f"{s2['ci_lower']:.3f}"],
+                [f"{mean_ci_conf}% UCI for Mean", f"{s1['ci_upper']:.3f}", f"{s2['ci_upper']:.3f}"],
             ]
-            axr.text(0.62, 0.96, s1["label"], ha="center", va="top", fontsize=10, fontweight="bold")
-            axr.text(0.90, 0.96, s2["label"], ha="center", va="top", fontsize=10, fontweight="bold")
-            y = 0.90
-            for name, v1, v2 in rows:
-                axr.text(0.02, y, name, ha="left", va="center", fontsize=8.8, fontweight="bold")
-                show1 = v1 if isinstance(v1, str) else ("-" if pd.isna(v1) else f"{v1:.3f}")
-                show2 = v2 if isinstance(v2, str) else ("-" if pd.isna(v2) else f"{v2:.3f}")
-                axr.text(0.62, y, show1, ha="center", va="center", fontsize=9)
-                axr.text(0.90, y, show2, ha="center", va="center", fontsize=9)
-                y -= 0.055
+            for label, v1, v2 in rows:
+                axr.text(x0, y, label, ha="left", va="center", fontsize=10.5, weight="bold")
+                axr.text(x1, y, v1, ha="center", va="center", fontsize=10.5)
+                axr.text(x2, y, v2, ha="center", va="center", fontsize=10.5)
+                y -= 0.06
 
-        plt.tight_layout()
+        fig.tight_layout()
         return fig
 
     if data_input:
@@ -2051,6 +1951,7 @@ elif app_selection == "07 - Tolerance & Confidence Intervals":
             st.error(str(e))
 
 
+
 # -------------------------------------------------
 # App 08 PCA Analysis
 # -------------------------------------------------
@@ -2070,6 +1971,7 @@ elif app_selection == "08 - PCA Analysis":
                 label_col = st.selectbox("Label column (optional)", ["(None)"] + all_cols)
             with c3:
                 group_col = st.selectbox("Group column (optional)", ["(None)"] + [c for c in all_cols if c != label_col])
+
             if len(vars_sel) >= 2:
                 X = df[vars_sel].apply(to_numeric).dropna()
                 Z = (X - X.mean()) / X.std(ddof=1)
@@ -2081,7 +1983,7 @@ elif app_selection == "08 - PCA Analysis":
                     "Principal Component": ["PC1", "PC2"],
                     "Eigenvalue": pca.explained_variance_,
                     "Variance Explained (%)": exp,
-                    "Cumulative Variance (%)": np.cumsum(exp)
+                    "Cumulative Variance (%)": np.cumsum(exp),
                 })
                 load_df = pd.DataFrame({"Variable": vars_sel, "PC1": loadings[:, 0], "PC2": loadings[:, 1]})
                 report_table(eig, "Eigenvalues and explained variance", decimals)
@@ -2093,33 +1995,64 @@ elif app_selection == "08 - PCA Analysis":
                 if group_col != "(None)":
                     scores_df["Group"] = df.loc[X.index, group_col].astype(str).values
 
-                fig_scores, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                score_cfg = get_plot_cfg("PCA score plot")
+                fig_scores, ax = plt.subplots(figsize=(score_cfg["fig_w"], score_cfg["fig_h"]))
+                color_cycle = [score_cfg["primary_color"], score_cfg["secondary_color"], score_cfg["tertiary_color"], "#9467bd", "#8c564b", "#e377c2"]
+
                 if group_col != "(None)":
-                    unique_groups = scores_df["Group"].unique()
-                    color_cycle = plt.get_cmap("tab10").colors
+                    unique_groups = list(scores_df["Group"].unique())
                     for i, grp in enumerate(unique_groups):
+                        col = color_cycle[i % len(color_cycle)]
                         m = scores_df["Group"] == grp
-                        color = color_cycle[i % len(color_cycle)]
-                        ax.scatter(scores_df.loc[m, "PC1"], scores_df.loc[m, "PC2"], s=46, label=str(grp), color=color)
-                        draw_conf_ellipse(scores_df.loc[m, ["PC1", "PC2"]].to_numpy(), ax, edgecolor=color, alpha=0.15, lw=1.2)
+                        ax.scatter(
+                            scores_df.loc[m, "PC1"],
+                            scores_df.loc[m, "PC2"],
+                            s=score_cfg["marker_size"],
+                            color=col,
+                            label=str(grp),
+                        )
+                        draw_conf_ellipse(
+                            scores_df.loc[m, ["PC1", "PC2"]].to_numpy(),
+                            ax,
+                            edgecolor=col,
+                            facecolor=col,
+                            plot_key="PCA score plot",
+                        )
                 else:
-                    ax.scatter(scores_df["PC1"], scores_df["PC2"], s=46, color=PRIMARY_COLOR, label="Scores")
-                    draw_conf_ellipse(scores_df[["PC1", "PC2"]].to_numpy(), ax, edgecolor=PRIMARY_COLOR, alpha=0.15, lw=1.2)
+                    col = score_cfg["primary_color"]
+                    ax.scatter(scores_df["PC1"], scores_df["PC2"], s=score_cfg["marker_size"], color=col, label="Scores")
+                    draw_conf_ellipse(scores_df[["PC1", "PC2"]].to_numpy(), ax, edgecolor=col, facecolor=col, plot_key="PCA score plot")
+
                 if label_col != "(None)":
                     for _, row in scores_df.iterrows():
                         ax.text(row["PC1"], row["PC2"], str(row["Label"]), fontsize=8)
-                ax.axhline(0, color="#64748b", lw=1)
-                ax.axvline(0, color="#64748b", lw=1)
-                apply_ax_style(ax, "PCA score plot", f"PC1 ({exp[0]:.1f}% var)", f"PC2 ({exp[1]:.1f}% var)", legend=True)
+
+                ax.axhline(0, color="#64748b", lw=score_cfg["aux_line_width"], ls=score_cfg["aux_line_style"])
+                ax.axvline(0, color="#64748b", lw=score_cfg["aux_line_width"], ls=score_cfg["aux_line_style"])
+                apply_ax_style(ax, "PCA score plot", f"PC1 ({exp[0]:.1f}% var)", f"PC2 ({exp[1]:.1f}% var)", legend=(group_col != "(None)"), plot_key="PCA score plot")
                 st.pyplot(fig_scores)
 
-                fig_load, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
-                ax2.axhline(0, color="#64748b", lw=1)
-                ax2.axvline(0, color="#64748b", lw=1)
+                load_cfg = get_plot_cfg("PCA loading plot")
+                fig_load, ax2 = plt.subplots(figsize=(load_cfg["fig_w"], load_cfg["fig_h"]))
+                ax2.axhline(0, color="#64748b", lw=load_cfg["aux_line_width"], ls=load_cfg["aux_line_style"])
+                ax2.axvline(0, color="#64748b", lw=load_cfg["aux_line_width"], ls=load_cfg["aux_line_style"])
                 for i, var in enumerate(vars_sel):
-                    ax2.arrow(0, 0, loadings[i, 0], loadings[i, 1], head_width=0.03, length_includes_head=True, color=PRIMARY_COLOR)
+                    ax2.arrow(
+                        0,
+                        0,
+                        loadings[i, 0],
+                        loadings[i, 1],
+                        head_width=load_cfg["arrow_size"],
+                        length_includes_head=True,
+                        color=load_cfg["primary_color"],
+                        lw=load_cfg["line_width"],
+                        ls=load_cfg["line_style"],
+                    )
                     ax2.text(loadings[i, 0], loadings[i, 1], var)
-                apply_ax_style(ax2, "PCA loading plot", "PC1", "PC2")
+                lim = max(1.1, np.max(np.abs(loadings)) * 1.2)
+                ax2.set_xlim(-lim, lim)
+                ax2.set_ylim(-lim, lim)
+                apply_ax_style(ax2, "PCA loading plot", "PC1", "PC2", plot_key="PCA loading plot")
                 st.pyplot(fig_load)
 
                 export_results(
@@ -2131,216 +2064,233 @@ elif app_selection == "08 - PCA Analysis":
                     python_tools="Python tools used here include pandas and numpy for data handling and standardization, sklearn.decomposition.PCA for principal component analysis, matplotlib for score and loading plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
                     table_map={"Explained Variance": eig, "Loadings": load_df, "Scores": scores_df.reset_index(drop=True)},
                     figure_map={"PCA score plot": fig_to_png_bytes(fig_scores), "PCA loading plot": fig_to_png_bytes(fig_load)},
-                    conclusion="The PCA score plot summarizes sample-level multivariate patterns, while the loading plot shows which variables are driving separation along PC1 and PC2.",
+                    conclusion="PCA transforms correlated variables into orthogonal components that summarize the major variation structure in the data and help reveal clustering, separation, and variable influence patterns.",
                     decimals=decimals,
                 )
         except Exception as e:
             st.error(str(e))
 
 
+
 # -------------------------------------------------
 # App 09 DoE / Response Surfaces
 # -------------------------------------------------
 elif app_selection == "09 - DoE / Response Surfaces":
-    app_header(
-        "🧪 App 09 - DoE / Response Surfaces",
-        "Build a full-factorial two-level design with optional blocks and center points, then analyze responses and visualize contour/surface plots."
-    )
-
-    tab_build, tab_analyze = st.tabs(["Build Design", "Analyze Responses"])
+    app_header("🧪 App 09 - DoE / Response Surfaces", "Build a full-factorial design, assign blocks, and fit linear / interaction / quadratic response-surface models.")
+    tab_build, tab_analyze = st.tabs(["Build design", "Analyze responses"])
 
     with tab_build:
-        st.markdown("### Generate a full-factorial DoE")
-        c1, c2, c3, c4 = st.columns(4)
+        st.markdown("### Build a full-factorial DoE")
+        st.markdown("Enter factor names and low / high levels. You can add blocks, center points, replicates, and randomize the run order within block.")
+        c1, c2, c3, c4 = st.columns([0.8, 0.9, 0.9, 1])
         with c1:
-            n_factors = st.number_input("Number of factors", min_value=2, max_value=6, value=2, step=1)
+            n_factors = st.number_input("Number of factors", min_value=2, max_value=8, value=2, step=1)
         with c2:
-            n_blocks = st.number_input("Number of blocks", min_value=1, max_value=12, value=1, step=1)
+            n_blocks = st.number_input("Number of blocks", min_value=1, max_value=20, value=1, step=1)
         with c3:
-            center_points = st.number_input("Center points per block", min_value=0, max_value=20, value=1, step=1)
+            replicates = st.number_input("Replicates / treatment / block", min_value=1, max_value=20, value=1, step=1)
         with c4:
-            replicates = st.number_input("Replicates of factorial portion", min_value=1, max_value=10, value=1, step=1)
+            center_points = st.number_input("Center points / block", min_value=0, max_value=20, value=0, step=1)
 
-        c5, c6 = st.columns(2)
-        with c5:
-            randomize = st.checkbox("Randomize run order within block", value=True)
-        with c6:
-            seed = st.number_input("Random seed", min_value=0, max_value=999999, value=123, step=1)
-
-        st.markdown("#### Factor definitions")
-        factor_info = []
-        cols = st.columns(3)
-        cols[0].markdown("**Factor**")
-        cols[1].markdown("**Low level**")
-        cols[2].markdown("**High level**")
-        for i in range(int(n_factors)):
-            c1, c2, c3 = st.columns(3)
-            name = c1.text_input(f"Factor {i+1} name", value=f"Factor{i+1}", key=f"doe_name_{i}")
-            low = c2.number_input(f"{name} low", value=-1.0 if i == 0 else 0.0, step=0.1, key=f"doe_low_{i}")
-            high = c3.number_input(f"{name} high", value=1.0 if i == 0 else 1.0, step=0.1, key=f"doe_high_{i}")
-            factor_info.append((name.strip() or f"Factor{i+1}", float(low), float(high)))
-
-        if any(low == high for _, low, high in factor_info):
-            st.warning("Low and high levels must be different for every factor.")
+        factor_names_txt = st.text_input(
+            "Factor names (comma-separated)",
+            value=", ".join([chr(65 + i) for i in range(n_factors)])
+        )
+        factor_names = [f.strip() for f in factor_names_txt.split(",") if f.strip()]
+        if len(factor_names) != n_factors:
+            st.warning(f"Please provide exactly {n_factors} factor names.")
         else:
-            design = generate_full_factorial_design(
-                factor_info,
-                n_blocks=int(n_blocks),
-                center_points_per_block=int(center_points),
-                replicates=int(replicates),
-                randomize=randomize,
-                seed=int(seed),
-            )
-            st.success(f"Generated {len(design)} runs.")
-            report_table(design, "Generated DoE design", DEFAULT_DECIMALS)
-            st.download_button(
-                "⬇️ Download design as Excel",
-                data=make_excel_bytes({"DoE Design": design}),
-                file_name="doe_design.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="doe_design_xlsx",
-            )
-            st.download_button(
-                "⬇️ Download design as CSV",
-                data=design.to_csv(index=False).encode("utf-8"),
-                file_name="doe_design.csv",
-                mime="text/csv",
-                key="doe_design_csv",
-            )
-            info_box("Fill response columns in the generated table, then paste the completed data into the “Analyze Responses” tab.")
+            st.markdown("**Low / high levels**")
+            cols = st.columns(n_factors)
+            low_vals, high_vals = {}, {}
+            for i, f in enumerate(factor_names):
+                with cols[i]:
+                    low_vals[f] = st.text_input(f"{f} low", value="-1", key=f"low_{f}")
+                    high_vals[f] = st.text_input(f"{f} high", value="1", key=f"high_{f}")
+
+            randomize = st.checkbox("Randomize runs within each block", value=True)
+            random_seed = st.number_input("Random seed", min_value=0, max_value=100000, value=42, step=1) if randomize else 42
+
+            try:
+                low_numeric = {f: float(low_vals[f]) for f in factor_names}
+                high_numeric = {f: float(high_vals[f]) for f in factor_names}
+                for f in factor_names:
+                    if high_numeric[f] == low_numeric[f]:
+                        raise ValueError(f"{f}: high level must differ from low level.")
+
+                coded_combos = list(product([-1, 1], repeat=n_factors))
+                rows = []
+                rng = np.random.default_rng(int(random_seed))
+                for block in range(1, int(n_blocks) + 1):
+                    block_rows = []
+                    for rep in range(1, int(replicates) + 1):
+                        for combo in coded_combos:
+                            row = {"Block": block, "Replicate": rep, "Center point": "No"}
+                            for i, f in enumerate(factor_names):
+                                coded = combo[i]
+                                actual = low_numeric[f] if coded == -1 else high_numeric[f]
+                                row[f"{f} (coded)"] = coded
+                                row[f] = actual
+                            block_rows.append(row)
+                    for cp in range(1, int(center_points) + 1):
+                        row = {"Block": block, "Replicate": np.nan, "Center point": f"CP{cp}"}
+                        for f in factor_names:
+                            row[f"{f} (coded)"] = 0
+                            row[f] = (low_numeric[f] + high_numeric[f]) / 2
+                        block_rows.append(row)
+                    if randomize:
+                        rng.shuffle(block_rows)
+                    for run_idx, row in enumerate(block_rows, start=1):
+                        row["Run"] = run_idx
+                        rows.append(row)
+
+                design_df = pd.DataFrame(rows)
+                ordered_cols = ["Block", "Run", "Replicate", "Center point"]
+                for f in factor_names:
+                    ordered_cols += [f"{f} (coded)", f]
+                design_df = design_df[ordered_cols]
+                report_table(design_df, "Generated DoE design", 3)
+
+                c_csv, c_xlsx = st.columns(2)
+                with c_csv:
+                    st.download_button(
+                        "⬇️ Export design as CSV",
+                        data=design_df.to_csv(index=False).encode("utf-8"),
+                        file_name="doe_design.csv",
+                        mime="text/csv",
+                    )
+                with c_xlsx:
+                    st.download_button(
+                        "⬇️ Export design as Excel",
+                        data=make_excel_bytes({"DoE Design": design_df}),
+                        file_name="doe_design.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            except Exception as e:
+                st.error(str(e))
 
     with tab_analyze:
-        st.markdown("### Analyze DoE responses")
-        data_input = st.text_area("Paste completed DoE data with headers", height=240, key="doe_data_input")
+        st.markdown("### Analyze responses and build response surfaces")
+        data_input = st.text_area("Paste completed DoE data with headers", height=240)
         decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="doe_dec")
         if data_input:
             try:
                 df = parse_pasted_table(data_input, header=True)
-                if df is None or df.empty:
-                    raise ValueError("Paste completed DoE data with headers.")
-                all_cols = list(df.columns)
                 num_cols = get_numeric_columns(df)
+                all_cols = list(df.columns)
 
-                c1, c2, c3, c4 = st.columns([1.3, 1.0, 1.0, 1.0])
+                c1, c2, c3, c4 = st.columns([1.35, 1, 1, 1])
                 with c1:
-                    factors = st.multiselect("Numeric factors", num_cols, default=num_cols[: min(2, len(num_cols))], key="doe_factors")
+                    factors = st.multiselect("Numeric factors", num_cols, default=num_cols[: min(2, len(num_cols))])
                 with c2:
-                    block_col = st.selectbox("Block column (optional)", ["(None)"] + [c for c in all_cols if c not in factors], key="doe_block")
+                    response = st.selectbox("Response", [c for c in num_cols if c not in factors] or num_cols)
                 with c3:
-                    response = st.selectbox("Response", [c for c in num_cols if c not in factors] or num_cols, key="doe_response")
+                    model_type = st.selectbox("Model type", ["linear", "interaction", "quadratic"])
                 with c4:
-                    model_type = st.selectbox("Model type", ["linear", "interaction", "quadratic"], index=1, key="doe_model")
+                    block_col = st.selectbox("Block column (optional)", ["(None)"] + [c for c in all_cols if c not in factors + [response]])
 
-                if len(factors) < 2:
-                    st.info("Choose at least two numeric factors.")
-                else:
-                    cols_needed = factors + [response] + ([] if block_col == "(None)" else [block_col])
-                    d = df[cols_needed].copy()
+                if len(factors) >= 2:
+                    use_cols = factors + [response] + ([block_col] if block_col != "(None)" else [])
+                    d = df[use_cols].copy()
                     for c in factors + [response]:
                         d[c] = to_numeric(d[c])
-
-                    if block_col != "(None)":
-                        d["Block"] = df[block_col].astype(str).values
-
                     d = d.dropna()
+
                     safe_factor_names = [f"F{i+1}" for i in range(len(factors))]
                     rename_map = {orig: safe for orig, safe in zip(factors, safe_factor_names)}
+                    inv_map = {v: k for k, v in rename_map.items()}
+
                     safe_df = d.rename(columns=rename_map).rename(columns={response: "Response"})
                     if block_col != "(None)":
-                        safe_df["Block"] = d["Block"].values
+                        safe_df["Block"] = d[block_col].astype(str).values
 
-                    formula = doe_formula(safe_factor_names, model_type=model_type, include_block=(block_col != "(None)"))
-                    model = smf.ols(formula, data=safe_df).fit()
-
-                    anova = anova_lm(model, typ=2).reset_index().rename(
-                        columns={"index": "Source", "sum_sq": "Sum of Squares", "df": "DF", "F": "F Value", "PR(>F)": "P Value"}
-                    )
-
-                    def pretty_source(s):
-                        s = str(s)
-                        if s == "Residual":
-                            return "Error"
-                        if s == "C(Block)":
-                            return block_col if block_col != "(None)" else "Block"
-                        for orig, safe in rename_map.items():
-                            s = s.replace(f"I({safe} ** 2)", f"{orig}²").replace(f"I({safe}**2)", f"{orig}²")
-                            s = s.replace(safe, orig)
-                        s = s.replace(":", " × ")
-                        return s
-
-                    anova["Source"] = anova["Source"].apply(pretty_source)
-                    anova["P Value"] = pd.to_numeric(anova["P Value"], errors="coerce")
-                    model_line = " + ".join(factors)
-                    if model_type in ["interaction", "quadratic"]:
-                        ints = [f"{a} × {b}" for i, a in enumerate(factors) for b in factors[i+1:]]
-                        if ints:
-                            model_line += " + " + " + ".join(ints)
-                    if model_type == "quadratic":
-                        model_line += " + " + " + ".join([f"{f}²" for f in factors])
+                    formula = doe_formula(safe_factor_names, model_type=model_type)
                     if block_col != "(None)":
-                        model_line = f"{block_col} + " + model_line
+                        formula += " + C(Block)"
 
-                    st.markdown(f"**Model: {response} ~ {model_line}**")
-                    report_table(anova, f"DoE ANOVA ({model_type} model)", decimals)
+                    model = smf.ols(formula, data=safe_df).fit()
+                    anova = anova_lm(model, typ=2).reset_index().rename(
+                        columns={
+                            "index": "Source",
+                            "sum_sq": "Sum of Squares",
+                            "df": "df",
+                            "F": "F-Statistic",
+                            "PR(>F)": "P-Value",
+                        }
+                    )
+                    anova["Mean Square"] = anova["Sum of Squares"] / anova["df"]
+                    anova["SS (%)"] = anova["Sum of Squares"] / anova["Sum of Squares"].sum() * 100
 
-                    coef = pd.DataFrame({"Term": model.params.index, "Coefficient": model.params.values, "P Value": model.pvalues.values})
-                    coef["Term"] = coef["Term"].apply(pretty_source)
+                    def pretty_term(term):
+                        term = str(term)
+                        if term == "Residual":
+                            return "Error"
+                        if term == "Intercept":
+                            return "Intercept"
+                        if term.startswith("C(Block)"):
+                            return "Block"
+                        term = term.replace(":", " × ")
+                        term = term.replace("I(", "").replace(" ** 2)", "²")
+                        for safe, orig in inv_map.items():
+                            term = term.replace(safe, orig)
+                        return term
+
+                    anova["Source"] = anova["Source"].map(pretty_term)
+                    coef = pd.DataFrame({
+                        "Term": [pretty_term(t) for t in model.params.index],
+                        "Coefficient": model.params.values,
+                        "P-Value": model.pvalues.values,
+                    })
+
+                    report_table(anova[["Source", "df", "Sum of Squares", "Mean Square", "F-Statistic", "P-Value", "SS (%)"]], f"DoE ANOVA ({model_type} model)", decimals)
                     report_table(coef, "Model coefficients", decimals)
 
-                    st.markdown("### Response surface / contour plots")
-                    xfac = st.selectbox("X-axis factor", factors, index=0, key="doe_xfac")
-                    yfac = st.selectbox("Y-axis factor", [f for f in factors if f != xfac], index=0, key="doe_yfac")
+                    xfac = st.selectbox("X-axis factor", factors, index=0)
+                    yfac = st.selectbox("Y-axis factor", [f for f in factors if f != xfac], index=0)
                     other_factors = [f for f in factors if f not in [xfac, yfac]]
                     fixed_vals = {}
                     if other_factors:
                         st.markdown("**Fixed levels for remaining factors**")
                         cols = st.columns(len(other_factors))
                         for i, f in enumerate(other_factors):
-                            low = float(np.nanmin(d[f]))
-                            high = float(np.nanmax(d[f]))
-                            default = float(np.nanmean(d[f]))
-                            fixed_vals[f] = cols[i].number_input(f, value=default, min_value=low, max_value=high, key=f"doe_fixed_{f}")
+                            fixed_vals[f] = cols[i].number_input(f, value=float(d[f].mean()))
 
-                    selected_block = None
-                    if block_col != "(None)":
-                        blocks = list(pd.Series(d["Block"]).astype(str).unique())
-                        selected_block = st.selectbox("Block to display on surface plots", blocks, key="doe_surface_block")
-
-                    x_vals = np.linspace(d[xfac].min(), d[xfac].max(), 40)
-                    y_vals = np.linspace(d[yfac].min(), d[yfac].max(), 40)
+                    x_vals = np.linspace(d[xfac].min(), d[xfac].max(), 60)
+                    y_vals = np.linspace(d[yfac].min(), d[yfac].max(), 60)
                     xx, yy = np.meshgrid(x_vals, y_vals)
                     grid = pd.DataFrame({xfac: xx.ravel(), yfac: yy.ravel()})
                     for f in other_factors:
                         grid[f] = fixed_vals[f]
                     if block_col != "(None)":
+                        block_default = str(d[block_col].iloc[0])
+                        selected_block = st.selectbox("Block level for prediction grid", sorted(d[block_col].astype(str).unique()))
                         grid["Block"] = selected_block
                     safe_grid = grid.rename(columns=rename_map)
                     zz = model.predict(safe_grid).to_numpy().reshape(xx.shape)
 
-                    fig_contour, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                    contour_cfg = get_plot_cfg("DoE contour")
+                    fig_contour, ax = plt.subplots(figsize=(contour_cfg["fig_w"], contour_cfg["fig_h"]))
                     cs = ax.contourf(xx, yy, zz, levels=20, cmap="viridis")
-                    cbar = fig_contour.colorbar(cs, ax=ax, label=response)
-                    if block_col != "(None)":
-                        plot_mask = d["Block"].astype(str) == str(selected_block)
-                        ax.scatter(d.loc[plot_mask, xfac], d.loc[plot_mask, yfac], c="white", edgecolor="black", s=36, label=f"Block {selected_block}")
-                    else:
-                        ax.scatter(d[xfac], d[yfac], c="white", edgecolor="black", s=36)
-                    title_block = f" ({block_col}={selected_block})" if block_col != "(None)" else ""
-                    apply_ax_style(ax, f"Contour plot for {response}{title_block}", xfac, yfac)
+                    ax.contour(xx, yy, zz, levels=10, colors=contour_cfg["primary_color"], linewidths=max(0.6, contour_cfg["aux_line_width"] * 0.7))
+                    fig_contour.colorbar(cs, ax=ax, label=response)
+                    ax.scatter(
+                        d[xfac],
+                        d[yfac],
+                        c="white",
+                        edgecolor=contour_cfg["primary_color"],
+                        s=contour_cfg["marker_size"],
+                    )
+                    apply_ax_style(ax, f"Contour plot for {response}", xfac, yfac, plot_key="DoE contour")
                     st.pyplot(fig_contour)
 
-                    fig_surface = plt.figure(figsize=(FIG_W, FIG_H + 0.5))
+                    fig_surface = plt.figure(figsize=(contour_cfg["fig_w"], contour_cfg["fig_h"] + 0.5))
                     ax3 = fig_surface.add_subplot(111, projection="3d")
                     surf = ax3.plot_surface(xx, yy, zz, cmap="viridis", edgecolor="none", alpha=0.88)
-                    if block_col != "(None)":
-                        plot_mask = d["Block"].astype(str) == str(selected_block)
-                        ax3.scatter(d.loc[plot_mask, xfac], d.loc[plot_mask, yfac], d.loc[plot_mask, response], c="black", s=28)
-                    else:
-                        ax3.scatter(d[xfac], d[yfac], d[response], c="black", s=28)
+                    ax3.scatter(d[xfac], d[yfac], d[response], c="black", s=max(12, contour_cfg["marker_size"] * 0.45))
                     ax3.set_xlabel(xfac)
                     ax3.set_ylabel(yfac)
                     ax3.set_zlabel(response)
-                    ax3.set_title(f"Response surface for {response}{title_block}")
+                    ax3.set_title(f"Response surface for {response}")
                     fig_surface.colorbar(surf, ax=ax3, shrink=0.68, aspect=12)
                     st.pyplot(fig_surface)
 
@@ -2353,9 +2303,9 @@ elif app_selection == "09 - DoE / Response Surfaces":
                         prefix="doe_response_surfaces",
                         report_title="Statistical Analysis Report",
                         module_name="DoE / Response Surfaces",
-                        statistical_analysis="A design-of-experiments model was fitted to the selected numeric response using the chosen numeric factors. Optional blocks were incorporated as a categorical term. Depending on the selected option, the model included linear terms only, linear plus interactions, or a quadratic response-surface structure. ANOVA, model coefficients, contour plots, surface plots, and residual diagnostics were generated from the fitted model.",
-                        offer_text="This analysis offers a way to generate full-factorial designs with blocks, quantify factor effects, inspect interactions, model curvature, and visualize the response surface over two selected factors while fixing remaining factors and an optional selected block.",
-                        python_tools="Python tools used here include pandas and numpy for data handling and design generation, itertools for full-factorial combinations, statsmodels for model fitting and ANOVA, matplotlib for contour, 3D surface, and residual diagnostic plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                        statistical_analysis="A design-of-experiments style regression model was fitted to the selected numeric response using the chosen numeric factors. Depending on the selected option, the model included linear terms only, linear plus interactions, or a quadratic response-surface structure. When a block column was supplied, block was included as a categorical effect. ANOVA, model coefficients, contour plots, surface plots, and residual diagnostics were generated from the fitted model.",
+                        offer_text="This analysis offers a practical way to build simple factorial designs, quantify factor effects, inspect interactions or curvature, account for blocks, and visualize the response surface over two selected factors while fixing any remaining factors at chosen values.",
+                        python_tools="Python tools used here include pandas and numpy for design construction and factor selection, itertools.product for generating full-factorial combinations, statsmodels for model fitting and ANOVA, matplotlib for contour, 3D surface, and residual diagnostic plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
                         table_map={"DoE ANOVA": anova, "Coefficients": coef},
                         figure_map={
                             "Contour plot": fig_to_png_bytes(fig_contour),
@@ -2363,7 +2313,7 @@ elif app_selection == "09 - DoE / Response Surfaces":
                             "Residuals vs fitted": fig_to_png_bytes(fig_res),
                             "Normal probability plot": fig_to_png_bytes(fig_qq),
                         },
-                        conclusion="The fitted DoE model can be used to assess influential factors, detect interactions or curvature, and visualize predicted response behavior across the chosen design space.",
+                        conclusion="The fitted DoE model can be used to assess influential factors, detect interactions or curvature, evaluate block effects, and visualize predicted response behavior across the chosen design space.",
                         decimals=decimals,
                     )
             except Exception as e:
