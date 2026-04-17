@@ -359,6 +359,170 @@ def fmt_p(p):
         return "-"
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
+# -------------------------------------------------
+# Compatibility helpers for refined modules
+# -------------------------------------------------
+def fit_linear(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    X = np.column_stack([np.ones(n), x])
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    intercept, slope = beta
+    fitted = X @ beta
+    resid = y - fitted
+    df = n - 2
+    s = np.sqrt(np.sum(resid**2) / df)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    ss_res = np.sum(resid**2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return {"intercept": intercept, "slope": slope, "XtX_inv": XtX_inv, "fitted": fitted, "resid": resid, "df": df, "s": s, "r2": r2}
+
+
+def reg_parse_prediction_points(text):
+    return parse_x_values(text)
+
+
+def reg_fit_linear_model(x, y):
+    model = fit_linear(x, y)
+    model["x"] = np.asarray(x, dtype=float).ravel()
+    model["y"] = np.asarray(y, dtype=float).ravel()
+    model["y_fit"] = model["fitted"]
+    return model
+
+
+def reg_predict_with_intervals(model, x_values, confidence=0.95, side="upper"):
+    x_values = np.asarray(x_values, dtype=float).ravel()
+    Xg = np.column_stack([np.ones(len(x_values)), x_values])
+    beta = np.array([model["intercept"], model["slope"]])
+    yhat = Xg @ beta
+    h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
+    se_mean = model["s"] * np.sqrt(h)
+    se_pred = model["s"] * np.sqrt(1 + h)
+    alpha = 1 - confidence
+    if side == "two-sided":
+        tcrit = t.ppf(1 - alpha / 2, model["df"])
+    else:
+        tcrit = t.ppf(confidence, model["df"])
+    ci_lower = yhat - tcrit * se_mean
+    ci_upper = yhat + tcrit * se_mean
+    pi_lower = yhat - tcrit * se_pred
+    pi_upper = yhat + tcrit * se_pred
+    return pd.DataFrame({
+        "x": x_values,
+        "fit": yhat,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "pi_lower": pi_lower,
+        "pi_upper": pi_upper,
+    })
+
+
+def reg_find_crossing(xv, yv, limit):
+    d = yv - limit
+    idx = np.where(d[:-1] * d[1:] <= 0)[0]
+    if len(idx) == 0:
+        return None
+    i = idx[0]
+    x1, x2 = xv[i], xv[i + 1]
+    y1, y2 = yv[i], yv[i + 1]
+    if y2 == y1:
+        return x1
+    return x1 + (limit - y1) * (x2 - x1) / (y2 - y1)
+
+
+def plot_regression_advanced(
+    data_df,
+    model,
+    grid_df,
+    confidence=0.95,
+    interval="pi",
+    side="upper",
+    title="",
+    xlabel="Time",
+    ylabel="Response",
+    point_label="Data",
+    y_suffix="%",
+    spec_enabled=False,
+    spec_limit=None,
+    spec_label="US",
+    crossing_on="auto",
+):
+    x = data_df["x"].to_numpy()
+    y = data_df["y"].to_numpy()
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    ax.scatter(x, y, color=PRIMARY_COLOR, s=MARKER_SIZE, alpha=0.85, label=point_label, zorder=3)
+    ax.plot(grid_df["x"], grid_df["fit"], color=FIT_LINE_COLOR, lw=LINE_WIDTH, ls=FIT_LINE_STYLE, label="Fitted Line")
+
+    if interval in ["ci", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Confidence Interval (CI)")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Upper CI")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Lower CI")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+
+    if interval in ["pi", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Prediction Interval (PI)")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Upper PI")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Lower PI")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+
+    crossing_x = None
+    if spec_enabled and spec_limit is not None:
+        ax.axhline(spec_limit, color="#27ae60", ls=SPEC_LINE_STYLE, lw=LINE_WIDTH, label=f"Limit ({spec_label})")
+        curve_map = {
+            "fit": grid_df["fit"].to_numpy(),
+            "ci_upper": grid_df["ci_upper"].to_numpy(),
+            "ci_lower": grid_df["ci_lower"].to_numpy(),
+            "pi_upper": grid_df["pi_upper"].to_numpy(),
+            "pi_lower": grid_df["pi_lower"].to_numpy(),
+        }
+        if crossing_on == "auto":
+            if interval in ["both", "pi"]:
+                crossing_on = "pi_upper" if side == "upper" else "pi_lower" if side == "lower" else "pi_upper"
+            else:
+                crossing_on = "ci_upper" if side == "upper" else "ci_lower" if side == "lower" else "ci_upper"
+        if crossing_on in curve_map:
+            crossing_x = reg_find_crossing(grid_df["x"].to_numpy(), curve_map[crossing_on], spec_limit)
+            if crossing_x is not None:
+                ax.axvline(crossing_x, color="#27ae60", ls=SPEC_LINE_STYLE, lw=LINE_WIDTH*0.8)
+        xmin = float(grid_df["x"].min())
+        xmax = float(grid_df["x"].max())
+        ymax_data = max(float(grid_df["fit"].max()), float(grid_df["ci_upper"].max()), float(grid_df["pi_upper"].max()), float(y.max()))
+        ymin_data = min(float(grid_df["fit"].min()), float(grid_df["ci_lower"].min()), float(grid_df["pi_lower"].min()), float(y.min()))
+        pad = 0.02 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
+        suffix = y_suffix or ""
+        ax.text(xmin + (xmax - xmin) * 0.02, spec_limit + pad, f"{spec_label} = {spec_limit:.1f}{suffix}",
+                ha="left", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2))
+        if crossing_x is not None:
+            ax.text(crossing_x, ymin_data + pad, f" {crossing_x:.2f}",
+                    color="#27ae60", ha="left", va="bottom", fontsize=11, weight="bold",
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2))
+
+    if y_suffix:
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
+
+    if not title.strip():
+        s1 = {"upper": "Upper One-Sided", "lower": "Lower One-Sided", "two-sided": "Two-Sided"}[side]
+        s2 = {"ci": "Confidence Intervals", "pi": "Prediction Intervals", "both": "Confidence and Prediction Intervals"}[interval]
+        title = f"{s1} {s2} ({confidence:.0%})"
+
+    apply_ax_style(ax, title, xlabel, ylabel, legend=True)
+    return fig, crossing_x
+
 
 # -------------------------------------------------
 # Table display and download helpers
