@@ -830,6 +830,303 @@ def doe_formula(safe_factors, model_type="interaction"):
     return "Response ~ " + " + ".join(terms)
 
 
+def dis_make_unique(names):
+    out = []
+    seen = {}
+    for i, n in enumerate(names):
+        n = str(n).strip()
+        if n == "" or n.lower() == "nan":
+            n = f"Col{i+1}"
+        if n in seen:
+            seen[n] += 1
+            n = f"{n}_{seen[n]}"
+        else:
+            seen[n] = 1
+        out.append(n)
+    return out
+
+
+def dis_parse_profile_table(text):
+    text = str(text).strip()
+    if not text:
+        raise ValueError("Paste a dissolution table.")
+    parsers = [
+        lambda s: pd.read_csv(StringIO(s), sep="	", header=None, engine="python"),
+        lambda s: pd.read_csv(StringIO(s), sep=",", header=None, engine="python"),
+        lambda s: pd.read_csv(StringIO(s), sep=";", header=None, engine="python"),
+    ]
+    df_raw = None
+    for parser in parsers:
+        try:
+            trial = parser(text)
+            if trial.shape[1] >= 2:
+                df_raw = trial.copy()
+                break
+        except Exception:
+            pass
+    if df_raw is None or df_raw.shape[1] < 2:
+        raise ValueError("Could not read the pasted table. Use at least 2 columns: Time and one or more units.")
+    df_raw = df_raw.dropna(how="all").reset_index(drop=True)
+    first_row = df_raw.iloc[0].astype(str).str.strip()
+    first_row_numeric = pd.to_numeric(first_row, errors="coerce").notna().all()
+    if first_row_numeric:
+        df = df_raw.copy()
+        df.columns = ["Time"] + [f"Unit{i}" for i in range(1, df.shape[1])]
+    else:
+        df = df_raw.iloc[1:].reset_index(drop=True).copy()
+        header = dis_make_unique(first_row.tolist())
+        df.columns = header
+        df.rename(columns={df.columns[0]: "Time"}, inplace=True)
+    df.columns = dis_make_unique(df.columns)
+    df["Time"] = to_numeric(df["Time"])
+    unit_cols = [c for c in df.columns if c != "Time"]
+    for c in unit_cols:
+        df[c] = to_numeric(df[c])
+    df = df.dropna(subset=["Time"]).copy()
+    df = df.loc[df[unit_cols].notna().any(axis=1)].copy()
+    df = df.sort_values("Time").reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError("No valid dissolution rows found after cleaning.")
+    return df
+
+
+def dis_get_unit_cols(df):
+    return [c for c in df.columns if c != "Time"]
+
+
+def dis_profile_summary(df):
+    unit_cols = dis_get_unit_cols(df)
+    out = pd.DataFrame({"Time": df["Time"].to_numpy()})
+    values = df[unit_cols].to_numpy(dtype=float)
+    out["n_units"] = np.sum(np.isfinite(values), axis=1)
+    out["mean"] = np.nanmean(values, axis=1)
+    out["sd"] = np.nanstd(values, axis=1, ddof=1)
+    out.loc[out["n_units"] <= 1, "sd"] = np.nan
+    out["cv_pct"] = 100 * out["sd"] / out["mean"]
+    out.loc[out["mean"] == 0, "cv_pct"] = np.nan
+    return out
+
+
+def dis_merge_profiles(ref_summary, test_summary):
+    merged = ref_summary.merge(test_summary, on="Time", how="inner", suffixes=("_ref", "_test"))
+    merged = merged.sort_values("Time").reset_index(drop=True)
+    if len(merged) == 0:
+        raise ValueError("Reference and Test have no common timepoints.")
+    return merged
+
+
+def dis_select_points(merged, include_zero=True, cutoff_mode="all", threshold=85.0):
+    use = merged.copy()
+    if not include_zero:
+        use = use.loc[use["Time"] != 0].copy()
+    if len(use) == 0:
+        raise ValueError("No timepoints left after filtering.")
+    first_both_ge_idx = None
+    for i in range(len(use)):
+        if use.loc[i, "mean_ref"] >= threshold and use.loc[i, "mean_test"] >= threshold:
+            first_both_ge_idx = i
+            break
+    if cutoff_mode == "apply_85" and first_both_ge_idx is not None:
+        use = use.iloc[:first_both_ge_idx + 1].copy()
+    if len(use) < 3:
+        raise ValueError("At least 3 selected timepoints are needed to calculate f2.")
+    return use.reset_index(drop=True), first_both_ge_idx
+
+
+def dis_calc_f2(ref_means, test_means):
+    ref_means = np.asarray(ref_means, dtype=float)
+    test_means = np.asarray(test_means, dtype=float)
+    if len(ref_means) < 1:
+        return np.nan
+    msd = np.mean((ref_means - test_means) ** 2)
+    return 50 * np.log10(100 / np.sqrt(1 + msd))
+
+
+def dis_get_selected_matrix(df, selected_times):
+    sub = df[df["Time"].isin(selected_times)].copy().sort_values("Time").reset_index(drop=True)
+    times_sorted = np.sort(np.asarray(selected_times, dtype=float))
+    if len(sub) != len(times_sorted) or not np.allclose(sub["Time"].to_numpy(dtype=float), times_sorted):
+        raise ValueError("Selected timepoints could not be aligned back to the original profile table.")
+    unit_cols = dis_get_unit_cols(df)
+    return sub[unit_cols].to_numpy(dtype=float), unit_cols
+
+
+def dis_fda_checks(ref_df, test_df, selected, threshold=85.0, include_zero=False):
+    ref_units = len(dis_get_unit_cols(ref_df))
+    test_units = len(dis_get_unit_cols(test_df))
+    same_original_times = np.array_equal(np.sort(ref_df["Time"].to_numpy(dtype=float)), np.sort(test_df["Time"].to_numpy(dtype=float)))
+    at_least_12 = (ref_units >= 12) and (test_units >= 12)
+    at_least_3_points = len(selected) >= 3
+    both_ge = (selected["mean_ref"] >= threshold) & (selected["mean_test"] >= threshold)
+    n_post85_kept = int(both_ge.sum())
+    one_post85_ok = n_post85_kept <= 1
+
+    selected_nonzero = selected[selected["Time"] > 0].copy()
+    if include_zero:
+        selected_nonzero = selected.copy()
+
+    early_cv_ref = early_cv_test = later_max_cv_ref = later_max_cv_test = np.nan
+    cv_ok = True
+    if len(selected_nonzero) > 0:
+        early_cv_ref = selected_nonzero.iloc[0]["cv_pct_ref"]
+        early_cv_test = selected_nonzero.iloc[0]["cv_pct_test"]
+        later_ref = selected_nonzero.iloc[1:]["cv_pct_ref"].dropna()
+        later_test = selected_nonzero.iloc[1:]["cv_pct_test"].dropna()
+        later_max_cv_ref = later_ref.max() if len(later_ref) > 0 else np.nan
+        later_max_cv_test = later_test.max() if len(later_test) > 0 else np.nan
+        if pd.notna(early_cv_ref) and early_cv_ref > 20:
+            cv_ok = False
+        if pd.notna(early_cv_test) and early_cv_test > 20:
+            cv_ok = False
+        if pd.notna(later_max_cv_ref) and later_max_cv_ref > 10:
+            cv_ok = False
+        if pd.notna(later_max_cv_test) and later_max_cv_test > 10:
+            cv_ok = False
+
+    fda_tbl = pd.DataFrame([
+        {"Criterion": "Same original timepoints in both profiles", "Pass": "Yes" if same_original_times else "No"},
+        {"Criterion": "At least 12 units in Reference and Test", "Pass": "Yes" if at_least_12 else "No"},
+        {"Criterion": "At least 3 selected timepoints for f2", "Pass": "Yes" if at_least_3_points else "No"},
+        {"Criterion": "No more than one selected point after both are ≥ threshold", "Pass": "Yes" if one_post85_ok else "No"},
+        {"Criterion": "CV at earlier selected timepoint ≤ 20% and later ≤ 10%", "Pass": "Yes" if cv_ok else "No"},
+    ])
+    detail_tbl = pd.DataFrame([{
+        "Reference units": ref_units,
+        "Test units": test_units,
+        "Selected timepoints": len(selected),
+        "Selected points where both ≥ threshold": n_post85_kept,
+        "Earlier CV ref": early_cv_ref,
+        "Earlier CV test": early_cv_test,
+        "Later max CV ref": later_max_cv_ref,
+        "Later max CV test": later_max_cv_test,
+    }])
+    conventional_ok = bool((fda_tbl["Pass"] == "Yes").all())
+    return fda_tbl, detail_tbl, conventional_ok
+
+
+def dis_bootstrap_f2(ref_mat, test_mat, n_boot=2000, seed=123):
+    rng = np.random.default_rng(seed)
+    n_ref = ref_mat.shape[1]
+    n_test = test_mat.shape[1]
+    out = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        idx_ref = rng.integers(0, n_ref, size=n_ref)
+        idx_test = rng.integers(0, n_test, size=n_test)
+        ref_mean = np.nanmean(ref_mat[:, idx_ref], axis=1)
+        test_mean = np.nanmean(test_mat[:, idx_test], axis=1)
+        out[b] = dis_calc_f2(ref_mean, test_mean)
+    return out
+
+
+def dis_jackknife_f2(ref_mat, test_mat):
+    vals = []
+    n_ref = ref_mat.shape[1]
+    n_test = test_mat.shape[1]
+    for j in range(n_ref):
+        keep = [i for i in range(n_ref) if i != j]
+        if len(keep) >= 1:
+            vals.append(dis_calc_f2(np.nanmean(ref_mat[:, keep], axis=1), np.nanmean(test_mat, axis=1)))
+    for j in range(n_test):
+        keep = [i for i in range(n_test) if i != j]
+        if len(keep) >= 1:
+            vals.append(dis_calc_f2(np.nanmean(ref_mat, axis=1), np.nanmean(test_mat[:, keep], axis=1)))
+    return np.asarray(vals, dtype=float)
+
+
+def dis_bca_interval(theta_hat, boot_vals, jack_vals, conf=0.90):
+    boot_vals = np.asarray(boot_vals, dtype=float)
+    boot_vals = boot_vals[np.isfinite(boot_vals)]
+    jack_vals = np.asarray(jack_vals, dtype=float)
+    jack_vals = jack_vals[np.isfinite(jack_vals)]
+    if len(boot_vals) < 10:
+        return np.nan, np.nan, np.nan, np.nan
+    alpha = 1 - conf
+    prop_less = np.mean(boot_vals < theta_hat)
+    eps = 1 / (2 * len(boot_vals))
+    prop_less = np.clip(prop_less, eps, 1 - eps)
+    z0 = norm.ppf(prop_less)
+    if len(jack_vals) < 3:
+        a = 0.0
+    else:
+        jack_mean = np.mean(jack_vals)
+        num = np.sum((jack_mean - jack_vals) ** 3)
+        den = 6 * (np.sum((jack_mean - jack_vals) ** 2) ** 1.5)
+        a = num / den if den > 0 else 0.0
+    z_low = norm.ppf(alpha / 2)
+    z_high = norm.ppf(1 - alpha / 2)
+    adj_low = norm.cdf(z0 + (z0 + z_low) / (1 - a * (z0 + z_low)))
+    adj_high = norm.cdf(z0 + (z0 + z_high) / (1 - a * (z0 + z_high)))
+    low = np.quantile(boot_vals, adj_low)
+    high = np.quantile(boot_vals, adj_high)
+    return low, high, z0, a
+
+
+def dis_percentile_interval(boot_vals, conf=0.90):
+    alpha = 1 - conf
+    return np.quantile(boot_vals, alpha / 2), np.quantile(boot_vals, 1 - alpha / 2)
+
+
+def dis_plot_profiles(ref_df, test_df, ref_summary, test_summary, selected, show_units=True, title="Dissolution Profiles", ylabel="% Dissolved"):
+    cfg = get_plot_cfg("Dissolution comparison")
+    fig, ax = plt.subplots(figsize=(cfg["fig_w"], cfg["fig_h"]))
+    ref_unit_cols = dis_get_unit_cols(ref_df)
+    test_unit_cols = dis_get_unit_cols(test_df)
+    c_ref = cfg["primary_color"]
+    c_test = cfg["secondary_color"]
+    sel_ms = max(40, int(cfg["marker_size"] * 1.8))
+    if show_units:
+        for c in ref_unit_cols:
+            ax.plot(ref_df["Time"], ref_df[c], color=c_ref, alpha=0.15, linewidth=max(0.8, cfg["aux_line_width"]))
+        for c in test_unit_cols:
+            ax.plot(test_df["Time"], test_df[c], color=c_test, alpha=0.15, linewidth=max(0.8, cfg["aux_line_width"]))
+    ax.plot(ref_summary["Time"], ref_summary["mean"], marker="o", color=c_ref, linewidth=cfg["line_width"], markersize=max(4, int(cfg["marker_size"] ** 0.5)), linestyle=cfg["line_style"], label="Reference Mean")
+    ax.plot(test_summary["Time"], test_summary["mean"], marker="o", color=c_test, linewidth=cfg["line_width"], markersize=max(4, int(cfg["marker_size"] ** 0.5)), linestyle=cfg["line_style"], label="Test Mean")
+    ax.scatter(selected["Time"], selected["mean_ref"], marker="s", edgecolor="black", facecolor="none", s=sel_ms, linewidth=1.2, label="Selected Ref Points", zorder=4)
+    ax.scatter(selected["Time"], selected["mean_test"], marker="s", edgecolor="black", facecolor="none", s=sel_ms, linewidth=1.2, label="Selected Test Points", zorder=4)
+    apply_ax_style(ax, title, "Time", ylabel, legend=True, plot_key="Dissolution comparison")
+    return fig
+
+
+def dis_plot_bootstrap_f2_distribution(boot_vals, observed_f2, ci_low=None, ci_high=None, ci_label="90% CI", title="Distribution of f2 Similarity Factor", x_min=50, x_max=100):
+    cfg = get_plot_cfg("Dissolution comparison")
+    boot_vals = np.asarray(boot_vals, dtype=float)
+    boot_vals = boot_vals[np.isfinite(boot_vals)]
+    if len(boot_vals) < 5:
+        return None
+    fig, ax = plt.subplots(figsize=(cfg["fig_w"], cfg["fig_h"]))
+    sd_boot = np.std(boot_vals, ddof=1)
+    if sd_boot > 0:
+        kde = gaussian_kde(boot_vals)
+        x_lo = min(x_min, np.min(boot_vals) - 2 * sd_boot, observed_f2 - 5)
+        x_hi = max(x_max, np.max(boot_vals) + 2 * sd_boot, observed_f2 + 5)
+        if ci_low is not None:
+            x_lo = min(x_lo, ci_low - 3)
+        if ci_high is not None:
+            x_hi = max(x_hi, ci_high + 3)
+        x_grid = np.linspace(x_lo, x_hi, 600)
+        y_grid = kde(x_grid)
+        ax.fill_between(x_grid, y_grid, color=cfg["band_color"], alpha=0.15)
+        ax.plot(x_grid, y_grid, color=cfg["primary_color"], linewidth=cfg["line_width"], linestyle=cfg["line_style"])
+        y_top = float(np.max(y_grid))
+    else:
+        ax.axvline(observed_f2, color=cfg["primary_color"], linewidth=cfg["line_width"])
+        y_top = 1.0
+    ax.axvline(observed_f2, color=cfg["primary_color"], linestyle=cfg["aux_line_style"], linewidth=cfg["aux_line_width"])
+    if ci_low is not None:
+        ax.axvline(ci_low, color=cfg["tertiary_color"], linestyle=cfg["aux_line_style"], linewidth=cfg["line_width"])
+    if ci_high is not None:
+        ax.axvline(ci_high, color=cfg["tertiary_color"], linestyle=cfg["aux_line_style"], linewidth=cfg["line_width"])
+    ax.text(observed_f2 - 0.8, y_top * 0.52, f"Original f2: {observed_f2:.1f}", rotation=90, ha="right", va="center", fontsize=10, color=cfg["primary_color"], weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
+    if ci_low is not None:
+        ax.text(ci_low - 0.8, y_top * 0.58, f"{ci_label} Lower: {ci_low:.1f}", rotation=90, ha="right", va="center", fontsize=10, color=cfg["tertiary_color"], weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
+    if ci_high is not None:
+        ax.text(ci_high + 0.8, y_top * 0.58, f"{ci_label} Upper: {ci_high:.1f}", rotation=90, ha="left", va="center", fontsize=10, color=cfg["tertiary_color"], weight="bold", bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
+    apply_ax_style(ax, title, "f2 values", "Density", legend=False, plot_key="Dissolution comparison")
+    ax.set_xlim(x_min, x_max)
+    return fig
+
+
+
 # -------------------------------------------------
 # App 01 Descriptive Statistics
 # -------------------------------------------------
@@ -1760,65 +2057,189 @@ elif app_selection == "03 - Shelf Life Estimator":
         except Exception as e:
             st.error(str(e))
 
+
 elif app_selection == "04 - Dissolution Comparison (f2)":
-    app_header("💊 App 04 - Dissolution Comparison (f2)", "Paste reference and test profiles and compare them with the similarity factor f₂.")
-    c1, c2 = st.columns(2)
-    with c1:
+    app_header("💊 App 04 - Dissolution Comparison (f2)", "FDA-style point selection, conventional f2 checks, and optional bootstrap / BCa confidence intervals.")
+
+    col1, col2 = st.columns(2)
+    with col1:
         ref_text = st.text_area("Reference profile table", height=220)
-    with c2:
+    with col2:
         test_text = st.text_area("Test profile table", height=220)
-    decimals = st.slider("Decimals", 1, 8, 2, key="f2_dec")
+
+    s1, s2, s3 = st.columns([1.1, 1.4, 0.9])
+    with s1:
+        include_zero = st.checkbox("Include time zero", value=False)
+    with s2:
+        cutoff_mode = st.selectbox(
+            "Point selection",
+            ["all", "apply_85"],
+            format_func=lambda x: "Use all common timepoints" if x == "all" else "FDA-style: stop after first point where both are ≥ threshold",
+        )
+    with s3:
+        threshold = st.number_input("Threshold", value=85.0, step=1.0)
+
+    b1, b2, b3, b4 = st.columns([1, 1.1, 1.1, 0.8])
+    with b1:
+        bootstrap_on = st.checkbox("Bootstrap f2 CI", value=False)
+    with b2:
+        boot_method = st.selectbox("Bootstrap CI method", ["percentile", "bca", "both"], format_func=lambda x: {"percentile": "Percentile", "bca": "BCa", "both": "Both"}[x], disabled=not bootstrap_on)
+    with b3:
+        boot_conf = st.slider("Bootstrap confidence", 0.80, 0.99, 0.90, 0.01, format="%.2f", disabled=not bootstrap_on)
+    with b4:
+        decimals = st.slider("Decimals", 1, 8, 2, key="f2_dec")
+
+    b5, b6, b7 = st.columns([1, 1, 1])
+    with b5:
+        boot_n = st.number_input("Resamples", min_value=200, max_value=50000, value=2000, step=100, disabled=not bootstrap_on)
+    with b6:
+        boot_seed = st.number_input("Seed", min_value=0, value=123, step=1, disabled=not bootstrap_on)
+    with b7:
+        show_units = st.checkbox("Show individual unit traces", value=True)
+
+    p1, p2 = st.columns(2)
+    with p1:
+        profile_title = st.text_input("Profile plot title", value="Dissolution Profiles")
+    with p2:
+        y_label = st.text_input("Y label", value="% Dissolved")
+
     if ref_text and test_text:
         try:
-            ref = parse_pasted_table(ref_text, header=True)
-            test = parse_pasted_table(test_text, header=True)
-            ref.iloc[:, 0] = to_numeric(ref.iloc[:, 0])
-            test.iloc[:, 0] = to_numeric(test.iloc[:, 0])
-            ref = ref.dropna().reset_index(drop=True)
-            test = test.dropna().reset_index(drop=True)
-            if len(ref) == 0 or len(test) == 0 or not np.allclose(ref.iloc[:, 0], test.iloc[:, 0]):
-                raise ValueError("Reference and test must have matching time points in the first column.")
-            time_col = ref.columns[0]
-            time = to_numeric(ref.iloc[:, 0])
-            ref_vals = ref.iloc[:, 1:].apply(to_numeric)
-            test_vals = test.iloc[:, 1:].apply(to_numeric)
-            summary = pd.DataFrame({
-                time_col: time,
-                "Reference Mean": ref_vals.mean(axis=1),
-                "Reference SD": ref_vals.std(axis=1, ddof=1),
-                "Reference CV (%)": ref_vals.std(axis=1, ddof=1) / ref_vals.mean(axis=1) * 100,
-                "Test Mean": test_vals.mean(axis=1),
-                "Test SD": test_vals.std(axis=1, ddof=1),
-                "Test CV (%)": test_vals.std(axis=1, ddof=1) / test_vals.mean(axis=1) * 100,
+            ref_df = dis_parse_profile_table(ref_text)
+            test_df = dis_parse_profile_table(test_text)
+            ref_summary = dis_profile_summary(ref_df)
+            test_summary = dis_profile_summary(test_df)
+            merged = dis_merge_profiles(ref_summary, test_summary)
+            selected, first_both_ge_idx = dis_select_points(merged=merged, include_zero=include_zero, cutoff_mode=cutoff_mode, threshold=threshold)
+            f2 = dis_calc_f2(selected["mean_ref"], selected["mean_test"])
+            selected = selected.copy()
+            selected["abs_diff"] = (selected["mean_ref"] - selected["mean_test"]).abs()
+            selected["sq_diff"] = (selected["mean_ref"] - selected["mean_test"]) ** 2
+            fda_tbl, fda_detail_tbl, conventional_ok = dis_fda_checks(ref_df=ref_df, test_df=test_df, selected=selected, threshold=threshold, include_zero=include_zero)
+            all_points_tbl = merged.copy()
+            all_points_tbl["Used for f2"] = np.where(all_points_tbl["Time"].isin(selected["Time"]), "Yes", "No")
+            assess_tbl = pd.DataFrame({
+                "Selected timepoints": [len(selected)],
+                "f2 Statistic": [f2],
+                "Conclusion": ["Similar (f2 ≥ 50)" if f2 >= 50 else "Not similar (f2 < 50)"],
+                "FDA-style applicability": ["Applicable" if conventional_ok else "Criteria warning"],
             })
-            summary["Absolute Difference"] = (summary["Reference Mean"] - summary["Test Mean"]).abs()
-            summary["Squared Difference"] = (summary["Reference Mean"] - summary["Test Mean"]) ** 2
-            f2 = 50 * np.log10((1 + summary["Squared Difference"].mean()) ** -0.5 * 100)
-            verdict = "Similar" if f2 >= 50 else "Not Similar"
-            assess = pd.DataFrame({"Similarity Factor f₂": [f2], "Conclusion": [verdict]})
-            report_table(summary, "Dissolution profile summary", decimals)
-            report_table(assess, "Overall f₂ assessment", decimals)
 
-            fig_main, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-            ax.errorbar(time, summary["Reference Mean"], yerr=summary["Reference SD"], fmt='o-', color=PRIMARY_COLOR, lw=2, capsize=4, label="Reference")
-            ax.errorbar(time, summary["Test Mean"], yerr=summary["Test SD"], fmt='s-', color=SECONDARY_COLOR, lw=2, capsize=4, label="Test")
-            apply_ax_style(ax, f"Dissolution profiles (f₂ = {f2:.{decimals}f})", time_col, "Dissolved (%)", legend=True)
-            st.pyplot(fig_main)
+            fig_main = dis_plot_profiles(ref_df, test_df, ref_summary, test_summary, selected, show_units=show_units, title=profile_title, ylabel=y_label)
 
+            boot_tbl = None
+            boot_figs = {}
+            if bootstrap_on:
+                selected_times = np.sort(selected["Time"].to_numpy(dtype=float))
+                ref_mat, _ = dis_get_selected_matrix(ref_df, selected_times)
+                test_mat, _ = dis_get_selected_matrix(test_df, selected_times)
+                boot_vals = dis_bootstrap_f2(ref_mat=ref_mat, test_mat=test_mat, n_boot=int(boot_n), seed=int(boot_seed))
+                boot_tbl_rows = [{
+                    "Observed f2": f2,
+                    "Bootstrap mean f2": float(np.mean(boot_vals)),
+                    "Bootstrap median f2": float(np.median(boot_vals)),
+                    "Bootstrap SD": float(np.std(boot_vals, ddof=1)),
+                    "Resamples": int(boot_n),
+                    "Seed": int(boot_seed),
+                    "CI confidence": boot_conf,
+                }]
+                pct_low = pct_high = bca_low = bca_high = np.nan
+                if boot_method in ["percentile", "both"]:
+                    pct_low, pct_high = dis_percentile_interval(boot_vals, conf=boot_conf)
+                    boot_tbl_rows[0]["Percentile CI lower"] = pct_low
+                    boot_tbl_rows[0]["Percentile CI upper"] = pct_high
+                    boot_tbl_rows[0]["Percentile similarity by lower bound"] = "Yes" if pct_low >= 50 else "No"
+                if boot_method in ["bca", "both"]:
+                    jack_vals = dis_jackknife_f2(ref_mat, test_mat)
+                    bca_low, bca_high, z0, accel = dis_bca_interval(theta_hat=f2, boot_vals=boot_vals, jack_vals=jack_vals, conf=boot_conf)
+                    boot_tbl_rows[0]["BCa CI lower"] = bca_low
+                    boot_tbl_rows[0]["BCa CI upper"] = bca_high
+                    boot_tbl_rows[0]["BCa similarity by lower bound"] = "Yes" if pd.notna(bca_low) and bca_low >= 50 else "No"
+                    boot_tbl_rows[0]["BCa z0"] = z0
+                    boot_tbl_rows[0]["BCa acceleration"] = accel
+                boot_tbl = pd.DataFrame(boot_tbl_rows)
+                if boot_method in ["percentile", "both"]:
+                    fig_boot_pct = dis_plot_bootstrap_f2_distribution(boot_vals, f2, pct_low, pct_high, ci_label=f"{int(round(boot_conf*100))}%", title="Bootstrap distribution plot (Percentile CI)")
+                    if fig_boot_pct is not None:
+                        boot_figs["Bootstrap distribution plot (Percentile CI)"] = fig_boot_pct
+                if boot_method in ["bca", "both"]:
+                    fig_boot_bca = dis_plot_bootstrap_f2_distribution(boot_vals, f2, bca_low, bca_high, ci_label=f"{int(round(boot_conf*100))}%", title="Bootstrap distribution plot (BCa CI)")
+                    if fig_boot_bca is not None:
+                        boot_figs["Bootstrap distribution plot (BCa CI)"] = fig_boot_bca
+
+            verdict = "similar" if f2 >= 50 else "not similar"
+            info_cols = st.columns(4)
+            info_cols[0].metric("f2", f"{f2:.{decimals}f}")
+            info_cols[1].metric("Selected points", f"{len(selected)}")
+            info_cols[2].metric("Similarity decision", "Similar" if f2 >= 50 else "Not similar")
+            info_cols[3].metric("FDA-style check", "Pass" if conventional_ok else "Warning")
+
+            tab1, tab2, tab3 = st.tabs(["Summary", "FDA criteria & selected points", "Bootstrap"])
+            with tab1:
+                report_table(merged.rename(columns={
+                    "n_units_ref": "Ref. Units (N)", "mean_ref": "Ref. Mean", "sd_ref": "Ref. SD", "cv_pct_ref": "Ref. CV (%)",
+                    "n_units_test": "Test Units (N)", "mean_test": "Test Mean", "sd_test": "Test SD", "cv_pct_test": "Test CV (%)"
+                }), "Profile summary table", decimals)
+                report_table(assess_tbl, "f2 assessment", decimals)
+                st.pyplot(fig_main)
+            with tab2:
+                report_table(fda_tbl, "FDA-style criteria check", decimals)
+                report_table(fda_detail_tbl, "FDA-style criteria details", decimals)
+                report_table(all_points_tbl.rename(columns={
+                    "n_units_ref": "Ref. Units (N)", "mean_ref": "Ref. Mean", "sd_ref": "Ref. SD", "cv_pct_ref": "Ref. CV (%)",
+                    "n_units_test": "Test Units (N)", "mean_test": "Test Mean", "sd_test": "Test SD", "cv_pct_test": "Test CV (%)"
+                }), "Common timepoints and whether they were used in f2", decimals)
+                report_table(selected.rename(columns={
+                    "mean_ref": "Ref. Mean", "mean_test": "Test Mean", "sd_ref": "Ref. SD", "sd_test": "Test SD",
+                    "cv_pct_ref": "Ref. CV (%)", "cv_pct_test": "Test CV (%)", "abs_diff": "Absolute Difference", "sq_diff": "Squared Difference"
+                }), "Selected points used for f2 calculation", decimals)
+            with tab3:
+                if bootstrap_on and boot_tbl is not None:
+                    report_table(boot_tbl, "Bootstrap f2 confidence intervals", decimals)
+                    if boot_figs:
+                        for title, fig in boot_figs.items():
+                            st.pyplot(fig)
+                else:
+                    st.info("Enable 'Bootstrap f2 CI' above to calculate percentile and/or BCa confidence intervals and show the extra bootstrap graph.")
+
+            table_map = {
+                "Profile Summary": merged.rename(columns={
+                    "n_units_ref": "Ref. Units (N)", "mean_ref": "Ref. Mean", "sd_ref": "Ref. SD", "cv_pct_ref": "Ref. CV (%)",
+                    "n_units_test": "Test Units (N)", "mean_test": "Test Mean", "sd_test": "Test SD", "cv_pct_test": "Test CV (%)"
+                }),
+                "f2 Assessment": assess_tbl,
+                "FDA Criteria Check": fda_tbl,
+                "FDA Criteria Details": fda_detail_tbl,
+                "Selected Points Used for f2": selected.rename(columns={
+                    "mean_ref": "Ref. Mean", "mean_test": "Test Mean", "sd_ref": "Ref. SD", "sd_test": "Test SD",
+                    "cv_pct_ref": "Ref. CV (%)", "cv_pct_test": "Test CV (%)", "abs_diff": "Absolute Difference", "sq_diff": "Squared Difference"
+                }),
+            }
+            if boot_tbl is not None:
+                table_map["Bootstrap f2 Confidence Intervals"] = boot_tbl
+            figure_map = {"Dissolution profiles": fig_to_png_bytes(fig_main)}
+            for title, fig in boot_figs.items():
+                figure_map[title] = fig_to_png_bytes(fig)
+            conclusion = (
+                f"The calculated f2 value was {f2:.{decimals}f}, so the profiles were classified as {verdict}. "
+                + ("The FDA-style applicability checks were satisfied for conventional mean-based f2. " if conventional_ok else "One or more FDA-style applicability checks were flagged, so the conventional f2 interpretation should be reviewed carefully. ")
+                + ("Bootstrap confidence intervals were also calculated to quantify uncertainty in the f2 estimate." if boot_tbl is not None else "")
+            )
             export_results(
-                prefix="dissolution_f2",
+                prefix="dissolution_f2_enhanced",
                 report_title="Statistical Analysis Report",
                 module_name="Dissolution Comparison (f₂)",
-                statistical_analysis="Mean dissolution profiles were calculated for the reference and test products at each common time point. Variability was summarized with standard deviation and coefficient of variation. The similarity factor f₂ was then computed from the squared differences between the mean profiles.",
-                offer_text="This analysis offers a concise way to compare two dissolution profiles, identify the size of mean differences across time, and support a similarity conclusion using the commonly used f₂ metric.",
-                python_tools="Python tools used here include pandas and numpy for profile handling, matplotlib for the dissolution plot with error bars, openpyxl for Excel export, and reportlab for the PDF-style report.",
-                table_map={"Profile Summary": summary, "f2 Assessment": assess},
-                figure_map={"Dissolution profiles": fig_to_png_bytes(fig_main)},
-                conclusion=f"The calculated similarity factor was {f2:.{decimals}f}. Based on the usual threshold of 50, the two profiles were classified as {verdict.lower()}.",
+                statistical_analysis="Reference and test dissolution profiles were parsed as tables with time in the first column and unit-level values in the remaining columns. Mean, standard deviation, coefficient of variation, FDA-style point selection, and the similarity factor f₂ were calculated. Additional FDA-style applicability checks were evaluated, including unit count, selected point count, post-threshold point handling, and relative standard deviation expectations. When enabled, a bootstrap procedure was also used to estimate confidence intervals for f₂ using percentile and/or BCa methods.",
+                offer_text="This analysis offers both the conventional f₂ decision and the supporting FDA-style criteria behind that decision. It also shows exactly which timepoints were used in the f₂ calculation and, when bootstrap is enabled, provides an uncertainty distribution and interval estimate around the observed f₂ value.",
+                python_tools="Python tools used here include pandas and numpy for table parsing and profile summaries, scipy.stats and scipy.stats.gaussian_kde for bootstrap and density calculations, matplotlib for the dissolution profile and bootstrap distribution plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                table_map=table_map,
+                figure_map=figure_map,
+                conclusion=conclusion,
                 decimals=decimals,
             )
         except Exception as e:
             st.error(str(e))
+
 
 
 # -------------------------------------------------
