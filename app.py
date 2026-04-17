@@ -671,20 +671,27 @@ def tolerance_interval_normal(data, p=0.95, conf=0.95, two_sided=True):
     return mean, mean - k * sd, mean + k * sd
 
 
-def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR):
+def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, alpha=0.14, lw=1.25):
     if scores.shape[0] < 3:
         return
     cov = np.cov(scores[:, 0], scores[:, 1])
+    if not np.all(np.isfinite(cov)):
+        return
     eigvals, eigvecs = np.linalg.eigh(cov)
+    if np.any(eigvals <= 0):
+        return
     order = eigvals.argsort()[::-1]
     eigvals, eigvecs = eigvals[order], eigvecs[:, order]
     angle = np.degrees(np.arctan2(*eigvecs[:, 0][::-1]))
-    width, height = 2 * np.sqrt(5.991 * eigvals)
-    ell = Ellipse(scores.mean(axis=0), width, height, angle=angle, fill=False, lw=2, edgecolor=edgecolor)
+    width, height = 2 * np.sqrt(5.991 * eigvals)  # ~95% confidence ellipse
+    ell = Ellipse(
+        scores.mean(axis=0), width, height, angle=angle,
+        facecolor=edgecolor, edgecolor=edgecolor, alpha=alpha, lw=lw
+    )
     ax.add_patch(ell)
 
 
-def doe_formula(safe_factors, model_type="interaction"):
+def doe_formula(safe_factors, model_type="interaction", include_block=False):
     terms = list(safe_factors)
     if model_type in ["interaction", "quadratic"]:
         for i in range(len(safe_factors)):
@@ -693,7 +700,61 @@ def doe_formula(safe_factors, model_type="interaction"):
     if model_type == "quadratic":
         for f in safe_factors:
             terms.append(f"I({f}**2)")
+    if include_block:
+        terms = ["C(Block)"] + terms
     return "Response ~ " + " + ".join(terms)
+
+
+def generate_full_factorial_design(factor_info, n_blocks=1, center_points_per_block=0, replicates=1, randomize=True, seed=123):
+    import itertools
+    coded_rows = list(itertools.product([-1, 1], repeat=len(factor_info)))
+    rows = []
+    std_order = 1
+    for rep in range(replicates):
+        for idx, coded in enumerate(coded_rows):
+            row = {"StdOrder": std_order}
+            for (name, low, high), code in zip(factor_info, coded):
+                row[name] = low if code == -1 else high
+                row[f"{name} (coded)"] = code
+            rows.append(row)
+            std_order += 1
+
+    if n_blocks < 1:
+        n_blocks = 1
+
+    # Assign factorial runs to blocks as evenly as possible
+    for i, row in enumerate(rows):
+        row["Block"] = (i % n_blocks) + 1
+
+    # Add center points to each block
+    for b in range(1, n_blocks + 1):
+        for _ in range(center_points_per_block):
+            row = {"StdOrder": std_order, "Block": b}
+            for name, low, high in factor_info:
+                row[name] = (low + high) / 2
+                row[f"{name} (coded)"] = 0
+            rows.append(row)
+            std_order += 1
+
+    df = pd.DataFrame(rows)
+
+    if randomize:
+        rng = np.random.default_rng(seed)
+        randomized = []
+        run_no = 1
+        for b in sorted(df["Block"].unique()):
+            sub = df[df["Block"] == b].copy()
+            order = rng.permutation(len(sub))
+            sub = sub.iloc[order].reset_index(drop=True)
+            sub["Run"] = range(run_no, run_no + len(sub))
+            run_no += len(sub)
+            randomized.append(sub)
+        df = pd.concat(randomized, ignore_index=True)
+    else:
+        df["Run"] = range(1, len(df) + 1)
+
+    cols = ["Run", "StdOrder", "Block"] + [f[0] for f in factor_info] + [f"{f[0]} (coded)" for f in factor_info]
+    return df[cols]
 
 
 # -------------------------------------------------
@@ -871,7 +932,7 @@ if app_selection == "01 - Descriptive Statistics":
                     dens = np.zeros_like(xgrid)
             else:
                 dens = np.zeros_like(xgrid)
-            ax.plot(xgrid, density_y0 + dens, color=col, lw=2, clip_on=False)
+            ax.plot(xgrid, density_y0 + dens, color=col, lw=2)
             ax.hlines(density_y0, x_lo, x_hi, color="#111827", lw=0.8)
 
         offsets = [0.10, -0.10] if len(stats_list) > 1 else [0.0]
@@ -903,7 +964,7 @@ if app_selection == "01 - Descriptive Statistics":
                     ax.plot(s["mean"], yy, 'o', color=col, ms=6)
 
         ax.set_xlim(x_lo, x_hi)
-        ax.set_ylim(-0.7, 7)
+        ax.set_ylim(0.4, 6.6)
         ax.set_yticks([density_y0] + row_centers)
         ax.set_yticklabels(["Normal distribution"] + row_names)
         ax.set_title(title)
@@ -1034,7 +1095,6 @@ if app_selection == "01 - Descriptive Statistics":
 
                         fig = _graphical_summary_figure([ref_stats], f"Graphical Summary: {ref_col}")
                         st.markdown("### Graphical Summary")
-                        fig.tight_layout(pad=1.4)
                         st.pyplot(fig)
                         figs["Graphical Summary"] = fig_to_png_bytes(fig)
                         plt.close(fig)
@@ -2017,7 +2077,12 @@ elif app_selection == "08 - PCA Analysis":
                 scores = pca.fit_transform(Z)
                 loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
                 exp = pca.explained_variance_ratio_ * 100
-                eig = pd.DataFrame({"Principal Component": ["PC1", "PC2"], "Eigenvalue": pca.explained_variance_, "Variance Explained (%)": exp, "Cumulative Variance (%)": np.cumsum(exp)})
+                eig = pd.DataFrame({
+                    "Principal Component": ["PC1", "PC2"],
+                    "Eigenvalue": pca.explained_variance_,
+                    "Variance Explained (%)": exp,
+                    "Cumulative Variance (%)": np.cumsum(exp)
+                })
                 load_df = pd.DataFrame({"Variable": vars_sel, "PC1": loadings[:, 0], "PC2": loadings[:, 1]})
                 report_table(eig, "Eigenvalues and explained variance", decimals)
                 report_table(load_df, "Loading matrix", decimals)
@@ -2031,19 +2096,21 @@ elif app_selection == "08 - PCA Analysis":
                 fig_scores, ax = plt.subplots(figsize=(FIG_W, FIG_H))
                 if group_col != "(None)":
                     unique_groups = scores_df["Group"].unique()
-                    for grp in unique_groups:
+                    color_cycle = plt.get_cmap("tab10").colors
+                    for i, grp in enumerate(unique_groups):
                         m = scores_df["Group"] == grp
-                        ax.scatter(scores_df.loc[m, "PC1"], scores_df.loc[m, "PC2"], s=46, label=str(grp))
-                        draw_conf_ellipse(scores_df.loc[m, ["PC1", "PC2"]].to_numpy(), ax)
+                        color = color_cycle[i % len(color_cycle)]
+                        ax.scatter(scores_df.loc[m, "PC1"], scores_df.loc[m, "PC2"], s=46, label=str(grp), color=color)
+                        draw_conf_ellipse(scores_df.loc[m, ["PC1", "PC2"]].to_numpy(), ax, edgecolor=color, alpha=0.15, lw=1.2)
                 else:
-                    ax.scatter(scores_df["PC1"], scores_df["PC2"], s=46, color=PRIMARY_COLOR)
-                    draw_conf_ellipse(scores_df[["PC1", "PC2"]].to_numpy(), ax)
+                    ax.scatter(scores_df["PC1"], scores_df["PC2"], s=46, color=PRIMARY_COLOR, label="Scores")
+                    draw_conf_ellipse(scores_df[["PC1", "PC2"]].to_numpy(), ax, edgecolor=PRIMARY_COLOR, alpha=0.15, lw=1.2)
                 if label_col != "(None)":
                     for _, row in scores_df.iterrows():
                         ax.text(row["PC1"], row["PC2"], str(row["Label"]), fontsize=8)
                 ax.axhline(0, color="#64748b", lw=1)
                 ax.axvline(0, color="#64748b", lw=1)
-                apply_ax_style(ax, "PCA score plot", f"PC1 ({exp[0]:.1f}% var)", f"PC2 ({exp[1]:.1f}% var)", legend=(group_col != "(None)"))
+                apply_ax_style(ax, "PCA score plot", f"PC1 ({exp[0]:.1f}% var)", f"PC2 ({exp[1]:.1f}% var)", legend=True)
                 st.pyplot(fig_scores)
 
                 fig_load, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
@@ -2075,95 +2142,229 @@ elif app_selection == "08 - PCA Analysis":
 # App 09 DoE / Response Surfaces
 # -------------------------------------------------
 elif app_selection == "09 - DoE / Response Surfaces":
-    app_header("🧪 App 09 - DoE / Response Surfaces", "Fit linear, interaction, or quadratic DoE models and visualize contour and surface plots.")
-    data_input = st.text_area("Paste data with headers", height=240)
-    decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="doe_dec")
-    if data_input:
-        try:
-            df = parse_pasted_table(data_input, header=True)
-            num_cols = get_numeric_columns(df)
-            c1, c2, c3 = st.columns([1.35, 1, 1])
-            with c1:
-                factors = st.multiselect("Numeric factors", num_cols, default=num_cols[: min(2, len(num_cols))])
-            with c2:
-                response = st.selectbox("Response", [c for c in num_cols if c not in factors] or num_cols)
-            with c3:
-                model_type = st.selectbox("Model type", ["linear", "interaction", "quadratic"])
+    app_header(
+        "🧪 App 09 - DoE / Response Surfaces",
+        "Build a full-factorial two-level design with optional blocks and center points, then analyze responses and visualize contour/surface plots."
+    )
 
-            if len(factors) >= 2:
-                d = df[factors + [response]].copy()
-                for c in factors + [response]:
-                    d[c] = to_numeric(d[c])
-                d = d.dropna()
-                safe_factor_names = [f"F{i+1}" for i in range(len(factors))]
-                rename_map = {orig: safe for orig, safe in zip(factors, safe_factor_names)}
-                safe_df = d.rename(columns=rename_map).rename(columns={response: "Response"})
-                formula = doe_formula(safe_factor_names, model_type=model_type)
-                model = smf.ols(formula, data=safe_df).fit()
-                anova = anova_lm(model, typ=2).reset_index().rename(columns={"index": "Source", "sum_sq": "Sum of Squares", "df": "df", "F": "F-Statistic", "PR(>F)": "P-Value"})
-                anova["SS (%)"] = anova["Sum of Squares"] / anova["Sum of Squares"].sum() * 100
-                coef = pd.DataFrame({"Term": model.params.index, "Coefficient": model.params.values, "P-Value": model.pvalues.values})
-                report_table(anova, f"DoE ANOVA ({model_type} model)", decimals)
-                report_table(coef, "Model coefficients", decimals)
+    tab_build, tab_analyze = st.tabs(["Build Design", "Analyze Responses"])
 
-                xfac = st.selectbox("X-axis factor", factors, index=0)
-                yfac = st.selectbox("Y-axis factor", [f for f in factors if f != xfac], index=0)
-                other_factors = [f for f in factors if f not in [xfac, yfac]]
-                fixed_vals = {}
-                if other_factors:
-                    st.markdown("**Fixed levels for remaining factors**")
-                    cols = st.columns(len(other_factors))
-                    for i, f in enumerate(other_factors):
-                        fixed_vals[f] = cols[i].number_input(f, value=float(d[f].mean()))
+    with tab_build:
+        st.markdown("### Generate a full-factorial DoE")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            n_factors = st.number_input("Number of factors", min_value=2, max_value=6, value=2, step=1)
+        with c2:
+            n_blocks = st.number_input("Number of blocks", min_value=1, max_value=12, value=1, step=1)
+        with c3:
+            center_points = st.number_input("Center points per block", min_value=0, max_value=20, value=1, step=1)
+        with c4:
+            replicates = st.number_input("Replicates of factorial portion", min_value=1, max_value=10, value=1, step=1)
 
-                x_vals = np.linspace(d[xfac].min(), d[xfac].max(), 40)
-                y_vals = np.linspace(d[yfac].min(), d[yfac].max(), 40)
-                xx, yy = np.meshgrid(x_vals, y_vals)
-                grid = pd.DataFrame({xfac: xx.ravel(), yfac: yy.ravel()})
-                for f in other_factors:
-                    grid[f] = fixed_vals[f]
-                safe_grid = grid.rename(columns=rename_map)
-                zz = model.predict(safe_grid).to_numpy().reshape(xx.shape)
+        c5, c6 = st.columns(2)
+        with c5:
+            randomize = st.checkbox("Randomize run order within block", value=True)
+        with c6:
+            seed = st.number_input("Random seed", min_value=0, max_value=999999, value=123, step=1)
 
-                fig_contour, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-                cs = ax.contourf(xx, yy, zz, levels=20, cmap="viridis")
-                fig_contour.colorbar(cs, ax=ax, label=response)
-                ax.scatter(d[xfac], d[yfac], c="white", edgecolor="black", s=34)
-                apply_ax_style(ax, f"Contour plot for {response}", xfac, yfac)
-                st.pyplot(fig_contour)
+        st.markdown("#### Factor definitions")
+        factor_info = []
+        cols = st.columns(3)
+        cols[0].markdown("**Factor**")
+        cols[1].markdown("**Low level**")
+        cols[2].markdown("**High level**")
+        for i in range(int(n_factors)):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input(f"Factor {i+1} name", value=f"Factor{i+1}", key=f"doe_name_{i}")
+            low = c2.number_input(f"{name} low", value=-1.0 if i == 0 else 0.0, step=0.1, key=f"doe_low_{i}")
+            high = c3.number_input(f"{name} high", value=1.0 if i == 0 else 1.0, step=0.1, key=f"doe_high_{i}")
+            factor_info.append((name.strip() or f"Factor{i+1}", float(low), float(high)))
 
-                fig_surface = plt.figure(figsize=(FIG_W, FIG_H + 0.5))
-                ax3 = fig_surface.add_subplot(111, projection="3d")
-                surf = ax3.plot_surface(xx, yy, zz, cmap="viridis", edgecolor="none", alpha=0.88)
-                ax3.scatter(d[xfac], d[yfac], d[response], c="black", s=26)
-                ax3.set_xlabel(xfac)
-                ax3.set_ylabel(yfac)
-                ax3.set_zlabel(response)
-                ax3.set_title(f"Response surface for {response}")
-                fig_surface.colorbar(surf, ax=ax3, shrink=0.68, aspect=12)
-                st.pyplot(fig_surface)
+        if any(low == high for _, low, high in factor_info):
+            st.warning("Low and high levels must be different for every factor.")
+        else:
+            design = generate_full_factorial_design(
+                factor_info,
+                n_blocks=int(n_blocks),
+                center_points_per_block=int(center_points),
+                replicates=int(replicates),
+                randomize=randomize,
+                seed=int(seed),
+            )
+            st.success(f"Generated {len(design)} runs.")
+            report_table(design, "Generated DoE design", DEFAULT_DECIMALS)
+            st.download_button(
+                "⬇️ Download design as Excel",
+                data=make_excel_bytes({"DoE Design": design}),
+                file_name="doe_design.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="doe_design_xlsx",
+            )
+            st.download_button(
+                "⬇️ Download design as CSV",
+                data=design.to_csv(index=False).encode("utf-8"),
+                file_name="doe_design.csv",
+                mime="text/csv",
+                key="doe_design_csv",
+            )
+            info_box("Fill response columns in the generated table, then paste the completed data into the “Analyze Responses” tab.")
 
-                fig_res = residual_plot(model.fittedvalues, model.resid, xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
-                st.pyplot(fig_res)
-                fig_qq = qq_plot(model.resid, title="Normal probability plot of DoE residuals")
-                st.pyplot(fig_qq)
+    with tab_analyze:
+        st.markdown("### Analyze DoE responses")
+        data_input = st.text_area("Paste completed DoE data with headers", height=240, key="doe_data_input")
+        decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="doe_dec")
+        if data_input:
+            try:
+                df = parse_pasted_table(data_input, header=True)
+                if df is None or df.empty:
+                    raise ValueError("Paste completed DoE data with headers.")
+                all_cols = list(df.columns)
+                num_cols = get_numeric_columns(df)
 
-                export_results(
-                    prefix="doe_response_surfaces",
-                    report_title="Statistical Analysis Report",
-                    module_name="DoE / Response Surfaces",
-                    statistical_analysis="A design-of-experiments style regression model was fitted to the selected numeric response using the chosen numeric factors. Depending on the selected option, the model included linear terms only, linear plus interactions, or a quadratic response-surface structure. ANOVA, model coefficients, contour plots, surface plots, and residual diagnostics were generated from the fitted model.",
-                    offer_text="This analysis offers a way to quantify factor effects, inspect interactions, model curvature, and visualize the response surface over two selected factors while fixing any remaining factors at chosen values.",
-                    python_tools="Python tools used here include pandas and numpy for selecting factor and response columns, statsmodels for model fitting and ANOVA, matplotlib for contour, 3D surface, and residual diagnostic plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
-                    table_map={"DoE ANOVA": anova, "Coefficients": coef},
-                    figure_map={
-                        "Contour plot": fig_to_png_bytes(fig_contour),
-                        "Response surface": fig_to_png_bytes(fig_surface),
-                        "Residuals vs fitted": fig_to_png_bytes(fig_res),
-                        "Normal probability plot": fig_to_png_bytes(fig_qq),
-                    },
-                    conclusion="The fitted DoE model can be used to assess influential factors, detect interactions or curvature, and visualize predicted response behavior across the chosen design space.",
-                    decimals=decimals,
-                )
-        except Exception as e:
-            st.error(str(e))
+                c1, c2, c3, c4 = st.columns([1.3, 1.0, 1.0, 1.0])
+                with c1:
+                    factors = st.multiselect("Numeric factors", num_cols, default=num_cols[: min(2, len(num_cols))], key="doe_factors")
+                with c2:
+                    block_col = st.selectbox("Block column (optional)", ["(None)"] + [c for c in all_cols if c not in factors], key="doe_block")
+                with c3:
+                    response = st.selectbox("Response", [c for c in num_cols if c not in factors] or num_cols, key="doe_response")
+                with c4:
+                    model_type = st.selectbox("Model type", ["linear", "interaction", "quadratic"], index=1, key="doe_model")
+
+                if len(factors) < 2:
+                    st.info("Choose at least two numeric factors.")
+                else:
+                    cols_needed = factors + [response] + ([] if block_col == "(None)" else [block_col])
+                    d = df[cols_needed].copy()
+                    for c in factors + [response]:
+                        d[c] = to_numeric(d[c])
+
+                    if block_col != "(None)":
+                        d["Block"] = df[block_col].astype(str).values
+
+                    d = d.dropna()
+                    safe_factor_names = [f"F{i+1}" for i in range(len(factors))]
+                    rename_map = {orig: safe for orig, safe in zip(factors, safe_factor_names)}
+                    safe_df = d.rename(columns=rename_map).rename(columns={response: "Response"})
+                    if block_col != "(None)":
+                        safe_df["Block"] = d["Block"].values
+
+                    formula = doe_formula(safe_factor_names, model_type=model_type, include_block=(block_col != "(None)"))
+                    model = smf.ols(formula, data=safe_df).fit()
+
+                    anova = anova_lm(model, typ=2).reset_index().rename(
+                        columns={"index": "Source", "sum_sq": "Sum of Squares", "df": "DF", "F": "F Value", "PR(>F)": "P Value"}
+                    )
+
+                    def pretty_source(s):
+                        s = str(s)
+                        if s == "Residual":
+                            return "Error"
+                        if s == "C(Block)":
+                            return block_col if block_col != "(None)" else "Block"
+                        for orig, safe in rename_map.items():
+                            s = s.replace(f"I({safe} ** 2)", f"{orig}²").replace(f"I({safe}**2)", f"{orig}²")
+                            s = s.replace(safe, orig)
+                        s = s.replace(":", " × ")
+                        return s
+
+                    anova["Source"] = anova["Source"].apply(pretty_source)
+                    anova["P Value"] = pd.to_numeric(anova["P Value"], errors="coerce")
+                    model_line = " + ".join(factors)
+                    if model_type in ["interaction", "quadratic"]:
+                        ints = [f"{a} × {b}" for i, a in enumerate(factors) for b in factors[i+1:]]
+                        if ints:
+                            model_line += " + " + " + ".join(ints)
+                    if model_type == "quadratic":
+                        model_line += " + " + " + ".join([f"{f}²" for f in factors])
+                    if block_col != "(None)":
+                        model_line = f"{block_col} + " + model_line
+
+                    st.markdown(f"**Model: {response} ~ {model_line}**")
+                    report_table(anova, f"DoE ANOVA ({model_type} model)", decimals)
+
+                    coef = pd.DataFrame({"Term": model.params.index, "Coefficient": model.params.values, "P Value": model.pvalues.values})
+                    coef["Term"] = coef["Term"].apply(pretty_source)
+                    report_table(coef, "Model coefficients", decimals)
+
+                    st.markdown("### Response surface / contour plots")
+                    xfac = st.selectbox("X-axis factor", factors, index=0, key="doe_xfac")
+                    yfac = st.selectbox("Y-axis factor", [f for f in factors if f != xfac], index=0, key="doe_yfac")
+                    other_factors = [f for f in factors if f not in [xfac, yfac]]
+                    fixed_vals = {}
+                    if other_factors:
+                        st.markdown("**Fixed levels for remaining factors**")
+                        cols = st.columns(len(other_factors))
+                        for i, f in enumerate(other_factors):
+                            low = float(np.nanmin(d[f]))
+                            high = float(np.nanmax(d[f]))
+                            default = float(np.nanmean(d[f]))
+                            fixed_vals[f] = cols[i].number_input(f, value=default, min_value=low, max_value=high, key=f"doe_fixed_{f}")
+
+                    selected_block = None
+                    if block_col != "(None)":
+                        blocks = list(pd.Series(d["Block"]).astype(str).unique())
+                        selected_block = st.selectbox("Block to display on surface plots", blocks, key="doe_surface_block")
+
+                    x_vals = np.linspace(d[xfac].min(), d[xfac].max(), 40)
+                    y_vals = np.linspace(d[yfac].min(), d[yfac].max(), 40)
+                    xx, yy = np.meshgrid(x_vals, y_vals)
+                    grid = pd.DataFrame({xfac: xx.ravel(), yfac: yy.ravel()})
+                    for f in other_factors:
+                        grid[f] = fixed_vals[f]
+                    if block_col != "(None)":
+                        grid["Block"] = selected_block
+                    safe_grid = grid.rename(columns=rename_map)
+                    zz = model.predict(safe_grid).to_numpy().reshape(xx.shape)
+
+                    fig_contour, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+                    cs = ax.contourf(xx, yy, zz, levels=20, cmap="viridis")
+                    cbar = fig_contour.colorbar(cs, ax=ax, label=response)
+                    if block_col != "(None)":
+                        plot_mask = d["Block"].astype(str) == str(selected_block)
+                        ax.scatter(d.loc[plot_mask, xfac], d.loc[plot_mask, yfac], c="white", edgecolor="black", s=36, label=f"Block {selected_block}")
+                    else:
+                        ax.scatter(d[xfac], d[yfac], c="white", edgecolor="black", s=36)
+                    title_block = f" ({block_col}={selected_block})" if block_col != "(None)" else ""
+                    apply_ax_style(ax, f"Contour plot for {response}{title_block}", xfac, yfac)
+                    st.pyplot(fig_contour)
+
+                    fig_surface = plt.figure(figsize=(FIG_W, FIG_H + 0.5))
+                    ax3 = fig_surface.add_subplot(111, projection="3d")
+                    surf = ax3.plot_surface(xx, yy, zz, cmap="viridis", edgecolor="none", alpha=0.88)
+                    if block_col != "(None)":
+                        plot_mask = d["Block"].astype(str) == str(selected_block)
+                        ax3.scatter(d.loc[plot_mask, xfac], d.loc[plot_mask, yfac], d.loc[plot_mask, response], c="black", s=28)
+                    else:
+                        ax3.scatter(d[xfac], d[yfac], d[response], c="black", s=28)
+                    ax3.set_xlabel(xfac)
+                    ax3.set_ylabel(yfac)
+                    ax3.set_zlabel(response)
+                    ax3.set_title(f"Response surface for {response}{title_block}")
+                    fig_surface.colorbar(surf, ax=ax3, shrink=0.68, aspect=12)
+                    st.pyplot(fig_surface)
+
+                    fig_res = residual_plot(model.fittedvalues, model.resid, xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+                    st.pyplot(fig_res)
+                    fig_qq = qq_plot(model.resid, title="Normal probability plot of DoE residuals")
+                    st.pyplot(fig_qq)
+
+                    export_results(
+                        prefix="doe_response_surfaces",
+                        report_title="Statistical Analysis Report",
+                        module_name="DoE / Response Surfaces",
+                        statistical_analysis="A design-of-experiments model was fitted to the selected numeric response using the chosen numeric factors. Optional blocks were incorporated as a categorical term. Depending on the selected option, the model included linear terms only, linear plus interactions, or a quadratic response-surface structure. ANOVA, model coefficients, contour plots, surface plots, and residual diagnostics were generated from the fitted model.",
+                        offer_text="This analysis offers a way to generate full-factorial designs with blocks, quantify factor effects, inspect interactions, model curvature, and visualize the response surface over two selected factors while fixing remaining factors and an optional selected block.",
+                        python_tools="Python tools used here include pandas and numpy for data handling and design generation, itertools for full-factorial combinations, statsmodels for model fitting and ANOVA, matplotlib for contour, 3D surface, and residual diagnostic plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
+                        table_map={"DoE ANOVA": anova, "Coefficients": coef},
+                        figure_map={
+                            "Contour plot": fig_to_png_bytes(fig_contour),
+                            "Response surface": fig_to_png_bytes(fig_surface),
+                            "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                            "Normal probability plot": fig_to_png_bytes(fig_qq),
+                        },
+                        conclusion="The fitted DoE model can be used to assess influential factors, detect interactions or curvature, and visualize predicted response behavior across the chosen design space.",
+                        decimals=decimals,
+                    )
+            except Exception as e:
+                st.error(str(e))
