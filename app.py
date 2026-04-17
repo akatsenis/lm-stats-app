@@ -871,7 +871,7 @@ if app_selection == "01 - Descriptive Statistics":
                     dens = np.zeros_like(xgrid)
             else:
                 dens = np.zeros_like(xgrid)
-            ax.plot(xgrid, density_y0 + dens, color=col, lw=2)
+            ax.plot(xgrid, density_y0 + dens, color=col, lw=2, clip_on=False)
             ax.hlines(density_y0, x_lo, x_hi, color="#111827", lw=0.8)
 
         offsets = [0.10, -0.10] if len(stats_list) > 1 else [0.0]
