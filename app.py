@@ -925,73 +925,270 @@ elif app_selection == "02 - Regression Intervals":
         except Exception as e:
             st.error(str(e))
 
-
+# -------------------------------------------------
 # App 03 Shelf Life Estimator
 # -------------------------------------------------
 elif app_selection == "03 - Shelf Life Estimator":
-    app_header("⏳ App 03 - Shelf Life Estimator", "Estimate shelf life from a linear stability trend and a one-sided confidence band.")
-    c1, c2 = st.columns([1.4, 1])
+    app_header("⏳ App 03 - Shelf Life Estimator", "Paste stability data, choose lower or upper specification, and estimate shelf life from fit, CI, or PI crossing.")
+
+    def sl_predict_local(model, x_values, confidence=0.95, one_sided=True):
+        x_values = np.asarray(x_values, dtype=float).ravel()
+        Xg = np.column_stack([np.ones(len(x_values)), x_values])
+        beta = np.array([model["intercept"], model["slope"]])
+        fit = Xg @ beta
+        h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
+        se_mean = model["s"] * np.sqrt(h)
+        se_pred = model["s"] * np.sqrt(1 + h)
+        alpha = 1 - confidence
+        tcrit = t.ppf(confidence, model["df"]) if one_sided else t.ppf(1 - alpha / 2, model["df"])
+        return pd.DataFrame({
+            "x": x_values,
+            "fit": fit,
+            "ci_lower": fit - tcrit * se_mean,
+            "ci_upper": fit + tcrit * se_mean,
+            "pi_lower": fit - tcrit * se_pred,
+            "pi_upper": fit + tcrit * se_pred,
+        })
+
+    def sl_find_crossing_local(xv, yv, limit):
+        xv = np.asarray(xv, dtype=float)
+        yv = np.asarray(yv, dtype=float)
+        d = yv - limit
+        if len(d) == 0:
+            return None
+        if d[0] == 0:
+            return float(xv[0])
+        for i in range(len(d) - 1):
+            if d[i] == 0:
+                return float(xv[i])
+            if d[i] * d[i + 1] < 0:
+                x1, x2 = xv[i], xv[i + 1]
+                y1, y2 = yv[i], yv[i + 1]
+                if y2 == y1:
+                    return float(x1)
+                return float(x1 + (limit - y1) * (x2 - x1) / (y2 - y1))
+        return None
+
+    def sl_get_bound_column_local(spec_side, shelf_basis):
+        if shelf_basis == "fit":
+            return "fit"
+        if shelf_basis == "ci":
+            return "ci_lower" if spec_side == "lower" else "ci_upper"
+        if shelf_basis == "pi":
+            return "pi_lower" if spec_side == "lower" else "pi_upper"
+        raise ValueError("Invalid shelf-life basis.")
+
+    def sl_plot_local(data_df, grid_df, spec_side, spec_limit, shelf_basis, show_ci_band, show_pi_band,
+                      title, xlabel, ylabel, point_label, y_suffix, spec_label):
+        x = data_df["x"].to_numpy()
+        y = data_df["y"].to_numpy()
+        fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+
+        if show_pi_band:
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.10, label="PI band")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, lw=1.0, ls=(0, (4, 4)))
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, lw=1.0, ls=(0, (4, 4)))
+
+        if show_ci_band:
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.15, label="CI band")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, lw=1.0, ls="--")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, lw=1.0, ls="--")
+
+        ax.scatter(x, y, color=PRIMARY_COLOR, s=50, alpha=0.85, label=point_label, zorder=3)
+        ax.plot(grid_df["x"], grid_df["fit"], color="#2c3e50", lw=2, label="Fitted line")
+
+        bound_col = sl_get_bound_column_local(spec_side, shelf_basis)
+        bound_color = {"fit": "#2c3e50", "ci": BAND_COLOR, "pi": SECONDARY_COLOR}[shelf_basis]
+        bound_label = {
+            "fit": "Shelf-life line (fit)",
+            "ci": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} CI)",
+            "pi": f"Shelf-life bound ({'lower' if spec_side == 'lower' else 'upper'} PI)",
+        }[shelf_basis]
+        if shelf_basis != "fit":
+            ax.plot(grid_df["x"], grid_df[bound_col], color=bound_color, lw=2.5, label=bound_label)
+
+        ax.axhline(spec_limit, color="#27ae60", ls="--", lw=1.5, label=f"Limit ({spec_label})")
+        shelf_life = sl_find_crossing_local(grid_df["x"].to_numpy(), grid_df[bound_col].to_numpy(), spec_limit)
+        if shelf_life is not None:
+            ax.axvline(shelf_life, color="#27ae60", ls=":", lw=1.5)
+
+        xmin = float(grid_df["x"].min())
+        xmax = float(grid_df["x"].max())
+        ymax_data = max(np.max(y), np.max(grid_df["fit"]), np.max(grid_df["ci_upper"]), np.max(grid_df["pi_upper"]))
+        ymin_data = min(np.min(y), np.min(grid_df["fit"]), np.min(grid_df["ci_lower"]), np.min(grid_df["pi_lower"]))
+        pad = 0.03 * ((ymax_data - ymin_data) if ymax_data > ymin_data else 1)
+
+        ax.text(
+            xmin + (xmax - xmin) * 0.02,
+            spec_limit + pad,
+            f"{spec_label} = {spec_limit:.2f}{y_suffix}",
+            ha="left", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+            bbox=dict(facecolor="white", alpha=0.82, edgecolor="none", pad=3),
+        )
+        if shelf_life is not None:
+            ax.text(
+                shelf_life,
+                ymin_data + pad,
+                f" {shelf_life:.2f} ",
+                ha="right", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+                bbox=dict(facecolor="white", alpha=0.82, edgecolor="none", pad=2),
+            )
+
+        if y_suffix:
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
+
+        if not str(title).strip():
+            side_txt = "Lower Spec" if spec_side == "lower" else "Upper Spec"
+            basis_txt = {"fit": "Fit", "ci": "Confidence Bound", "pi": "Prediction Bound"}[shelf_basis]
+            title = f"Shelf Life Estimator ({side_txt}, {basis_txt})"
+
+        apply_ax_style(ax, title, xlabel, ylabel, legend=True)
+        return fig, shelf_life, bound_col
+
+    c1, c2 = st.columns([1.35, 1])
     with c1:
         xy_input = st.text_area("Paste Time and Response data (with or without headers)", height=220)
     with c2:
-        limit = st.number_input("Specification limit", value=90.0)
-        direction = st.selectbox("Degradation direction", ["Response decreases toward lower limit", "Response increases toward upper limit"])
-        conf = st.slider("One-sided confidence (%)", 80, 99, 95)
+        pred_x_text = st.text_area("Predict future X values (optional)", value="30\n36\n48", height=120)
         decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="sl_dec")
+
+    r1c1, r1c2, r1c3 = st.columns([1, 1, 1.15])
+    with r1c1:
+        spec_side = st.selectbox("Spec side", ["lower", "upper"], format_func=lambda x: "Lower spec" if x == "lower" else "Upper spec")
+    with r1c2:
+        shelf_basis = st.selectbox("Shelf-life on", ["ci", "pi", "fit"], format_func=lambda x: {"ci": "Confidence bound", "pi": "Prediction bound", "fit": "Fit line"}[x])
+    with r1c3:
+        confidence = st.slider("Confidence", 0.80, 0.99, 0.95, 0.01, format="%.2f")
+
+    r2c1, r2c2, r2c3, r2c4 = st.columns([1, 1, 1, 1])
+    with r2c1:
+        spec_value_txt = st.text_input("Spec value", value="90")
+    with r2c2:
+        spec_label = st.text_input("Spec label", value="Spec")
+    with r2c3:
+        show_ci_band = st.checkbox("Show CI band", value=True)
+    with r2c4:
+        show_pi_band = st.checkbox("Show PI band", value=False)
+
+    plot_title = st.text_input("Title", value="")
+
+    r3c1, r3c2, r3c3, r3c4 = st.columns([1, 1, 1, 0.8])
+    with r3c1:
+        xlabel_override = st.text_input("X label", value="")
+    with r3c2:
+        ylabel_override = st.text_input("Y label", value="")
+    with r3c3:
+        point_label = st.text_input("Point label", value="Data")
+    with r3c4:
+        y_suffix = st.text_input("Y suffix", value="%")
+
+    r4c1, r4c2 = st.columns([1, 1])
+    with r4c1:
+        x_min_txt = st.text_input("X min", value="")
+    with r4c2:
+        x_max_txt = st.text_input("X max", value="")
 
     if xy_input:
         try:
-            df, x_label, y_label = parse_xy(xy_input)
-            x, y = df["x"].to_numpy(), df["y"].to_numpy()
-            model = fit_linear(x, y)
-            decreasing = direction.startswith("Response decreases")
-            shelf, xg, fitg, band = estimate_shelf_life(model, limit, decreasing=decreasing, confidence=conf / 100, x_upper=max(x.max() * 1.5, x.max() + 1))
-            pred = predict_intervals(model, x, 1 - conf / 100)
-            table = pd.DataFrame({
-                x_label: x,
-                f"Actual {y_label}": y,
-                f"Fitted {y_label}": pred["Fitted"],
-                "Lower CI": pred["Lower CI"],
-                "Upper CI": pred["Upper CI"],
-                "Lower PI": pred["Lower PI"],
-                "Upper PI": pred["Upper PI"],
-            })
-            summary = pd.DataFrame({
+            data_df, x_label_from_header, y_label_from_header = parse_xy(xy_input)
+            xlabel = xlabel_override.strip() or x_label_from_header or "Time"
+            ylabel = ylabel_override.strip() or y_label_from_header or "Response"
+            pred_x = parse_x_values(pred_x_text)
+            spec_limit = parse_optional_float(spec_value_txt)
+            if spec_limit is None:
+                raise ValueError("Enter a valid specification value.")
+
+            x_data_max = float(data_df["x"].max())
+            x_future_max = float(np.max(pred_x)) if len(pred_x) > 0 else x_data_max
+            x_min = parse_optional_float(x_min_txt)
+            x_max = parse_optional_float(x_max_txt)
+            if x_min is None:
+                x_min = min(0.0, float(data_df["x"].min()))
+            if x_max is None:
+                x_max = max(x_data_max * 3, x_future_max * 1.15, x_data_max + 12)
+            if x_max <= x_min:
+                raise ValueError("X max must be greater than X min.")
+
+            model = fit_linear(data_df["x"], data_df["y"])
+            grid_x = np.linspace(x_min, x_max, 600)
+            grid_df = sl_predict_local(model, grid_x, confidence=confidence, one_sided=True)
+
+            fig_main, shelf_life, bound_col = sl_plot_local(
+                data_df=data_df,
+                grid_df=grid_df,
+                spec_side=spec_side,
+                spec_limit=spec_limit,
+                shelf_basis=shelf_basis,
+                show_ci_band=show_ci_band,
+                show_pi_band=show_pi_band,
+                title=plot_title,
+                xlabel=xlabel,
+                ylabel=ylabel,
+                point_label=point_label,
+                y_suffix=y_suffix,
+                spec_label=spec_label,
+            )
+            st.pyplot(fig_main)
+
+            summary_tbl = pd.DataFrame({
                 "Intercept": [model["intercept"]],
                 "Slope": [model["slope"]],
-                "Residual SD": [model["s"]],
                 "R²": [model["r2"]],
-                "Estimated Shelf Life": [shelf],
+                "Residual SD (s)": [model["s"]],
+                "Degrees of Freedom": [model["df"]],
+                "Shelf-life basis": [bound_col],
+                "Confidence": [f"{confidence:.0%} one-sided"],
+                "Estimated Shelf Life": [np.nan if shelf_life is None else shelf_life],
             })
-            report_table(summary, "Shelf-life regression summary", decimals)
-            report_table(table, "Observed and fitted values", decimals)
+            report_table(summary_tbl, "Shelf-life estimation summary", decimals)
+            report_table(data_df.rename(columns={"x": x_label_from_header, "y": y_label_from_header}), "Table 1: Parsed data", decimals)
 
-            fig_main, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-            ax.scatter(x, y, color=PRIMARY_COLOR, s=46, label="Observed")
-            ax.plot(xg, fitg, color="#111827", lw=2.2, label="Fit")
-            ax.plot(xg, band, color="#dc2626", lw=2.0, ls="--", label=f"{conf}% confidence band")
-            ax.axhline(limit, color=SECONDARY_COLOR, lw=2, ls=":", label="Specification limit")
-            if not np.isnan(shelf):
-                ax.axvline(shelf, color="#16a34a", lw=2, ls="--", label=f"Shelf life = {shelf:.{decimals}f}")
-            apply_ax_style(ax, "Shelf-life estimation", x_label, y_label, legend=True)
-            st.pyplot(fig_main)
+            new_pred_x = np.setdiff1d(pred_x, data_df["x"].to_numpy()) if len(pred_x) > 0 else np.array([])
+            if len(new_pred_x) > 0:
+                new_pts_df = pd.DataFrame({"x": new_pred_x, "y": np.nan})
+                combined_pts_df = pd.concat([data_df[["x", "y"]], new_pts_df], ignore_index=True)
+            else:
+                combined_pts_df = data_df[["x", "y"]].copy()
+            combined_pts_df = combined_pts_df.sort_values("x").reset_index(drop=True)
+            unique_x = combined_pts_df["x"].unique()
+            intervals_df = sl_predict_local(model, unique_x, confidence=confidence, one_sided=True)
+            final_table_df = pd.merge(combined_pts_df, intervals_df, on="x", how="left")
+            final_table_df = final_table_df[[c for c in ["x", "y", "fit", "ci_lower", "ci_upper", "pi_lower", "pi_upper"] if c in final_table_df.columns]]
+            final_table_df.columns = [xlabel, f"Actual {ylabel}", f"Fitted {ylabel}", "Lower CI", "Upper CI", "Lower PI", "Upper PI"]
+            report_table(final_table_df, "Table 2: Fitted values and one-sided bounds", decimals)
 
             fig_res = residual_plot(model["fitted"], model["resid"], xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
             st.pyplot(fig_res)
             fig_qq = qq_plot(model["resid"], title="Normal probability plot of stability residuals")
             st.pyplot(fig_qq)
 
-            conclusion = f"Shelf life was estimated as the first time at which the one-sided confidence band crossed the specification limit. The estimated shelf life was {('-' if np.isnan(shelf) else f'{shelf:.{decimals}f}')}."
+            conclusion = (
+                f"A linear regression was fitted to the stability data and one-sided bounds were calculated at {confidence:.0%} confidence. "
+                f"Shelf life was estimated using the {bound_col} crossing against the {spec_label} limit of {spec_limit:.{decimals}f}{y_suffix}. "
+                + (f"The estimated shelf life was {shelf_life:.{decimals}f}." if shelf_life is not None else "No crossing was found within the plotted range.")
+            )
             export_results(
-                prefix="shelf_life_estimator",
+                prefix="shelf_life_refined",
                 report_title="Statistical Analysis Report",
                 module_name="Shelf Life Estimator",
-                statistical_analysis="A simple linear regression model was applied to the response-versus-time stability data. A one-sided confidence band around the fitted mean response was then constructed. Shelf life was estimated as the earliest time point at which the relevant one-sided confidence limit crossed the specification limit.",
-                offer_text="This analysis offers a practical way to quantify a stability trend, visualize uncertainty, and derive a conservative shelf-life estimate aligned with common regression-based stability approaches.",
-                python_tools="Python tools used here include pandas and numpy for data preparation, scipy.stats for confidence-band calculations, matplotlib for fitted, residual, and normal probability plots, openpyxl for Excel export, and reportlab for the PDF-style report.",
-                table_map={"Shelf Life Summary": summary, "Observed and Fitted Values": table},
+                statistical_analysis=(
+                    "A simple linear regression model was fitted to the response-versus-time stability data using ordinary least squares. "
+                    "One-sided confidence and prediction bounds were then derived from the fitted model. Shelf life was estimated as the earliest time at which the selected basis "
+                    "(fit line, confidence bound, or prediction bound) crossed the chosen lower or upper specification limit."
+                ),
+                offer_text=(
+                    "This analysis offers a practical way to quantify the stability trend, visualize fitted performance and uncertainty, project future responses, and obtain a conservative shelf-life estimate based on either the fit, a confidence bound, or a prediction bound."
+                ),
+                python_tools=(
+                    "Python tools used here include pandas for parsing pasted Excel-style stability data, numpy for matrix calculations and prediction grids, scipy.stats for one-sided t-based bounds, matplotlib for the shelf-life, residual, and normal probability plots, openpyxl for Excel export, and reportlab for the PDF-style report."
+                ),
+                table_map={
+                    "Shelf-life Summary": summary_tbl,
+                    "Parsed Data": data_df.rename(columns={"x": x_label_from_header, "y": y_label_from_header}),
+                    "Fitted Values and One-Sided Bounds": final_table_df,
+                },
                 figure_map={
-                    "Shelf-life regression plot": fig_to_png_bytes(fig_main),
+                    "Shelf-life plot": fig_to_png_bytes(fig_main),
                     "Residuals vs fitted": fig_to_png_bytes(fig_res),
                     "Normal probability plot": fig_to_png_bytes(fig_qq),
                 },
