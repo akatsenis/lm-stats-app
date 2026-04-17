@@ -826,10 +826,10 @@ if app_selection == "01 - Descriptive Statistics":
 
         sr = None
         if shaded_range is not None:
-    try:
-        sr = np.asarray(shaded_range, dtype=float).ravel()
-    except Exception:
-        sr = None
+            try:
+                sr = np.asarray(shaded_range, dtype=float).ravel()
+            except Exception:
+                sr = None
 
 if sr is not None and sr.size == 2 and np.all(np.isfinite(sr)):
     ax.axvspan(sr[0], sr[1], color="#ef4444", alpha=0.10)
