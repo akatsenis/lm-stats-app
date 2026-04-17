@@ -196,13 +196,27 @@ def parse_one_col(text):
     return to_numeric(df.iloc[:, 0]).dropna().to_numpy()
 
 
-def get_numeric_columns(df, threshold=0.7):
-    out = []
+def get_numeric_columns(df, min_nonempty=2, required_numeric_ratio=0.95):
+    num_cols = []
     for col in df.columns:
-        converted = to_numeric(df[col])
-        if converted.notna().mean() >= threshold:
-            out.append(col)
-    return out
+        raw = df[col]
+        raw_str = raw.astype(str).str.strip()
+        nonempty_mask = raw.notna() & raw_str.ne("") & raw_str.str.lower().ne("nan")
+
+        if nonempty_mask.sum() < min_nonempty:
+            continue
+
+        converted = pd.to_numeric(
+            raw_str.str.replace("%", "", regex=False),
+            errors="coerce"
+        )
+
+        numeric_ratio_among_nonempty = converted[nonempty_mask].notna().mean()
+
+        if numeric_ratio_among_nonempty >= required_numeric_ratio:
+            num_cols.append(col)
+
+    return num_cols
 
 
 def fmt_p(p):
