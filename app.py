@@ -925,7 +925,7 @@ elif app_selection == "02 - Regression Intervals":
         except Exception as e:
             st.error(str(e))
 
-# -------------------------------------------------
+
 # App 03 Shelf Life Estimator
 # -------------------------------------------------
 elif app_selection == "03 - Shelf Life Estimator":
@@ -1198,10 +1198,6 @@ elif app_selection == "03 - Shelf Life Estimator":
         except Exception as e:
             st.error(str(e))
 
-
-# -------------------------------------------------
-# App 04 Dissolution Comparison (f2)
-# -------------------------------------------------
 elif app_selection == "04 - Dissolution Comparison (f2)":
     app_header("💊 App 04 - Dissolution Comparison (f2)", "Paste reference and test profiles and compare them with the similarity factor f₂.")
     c1, c2 = st.columns(2)
