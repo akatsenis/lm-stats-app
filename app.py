@@ -433,6 +433,203 @@ def predict_intervals(model, x_vals, alpha=0.05):
     })
 
 
+def reg_parse_prediction_points(text):
+    text = str(text).strip()
+    if not text:
+        return np.array([], dtype=float)
+    parts = re.split(r"[\s,\t;]+", text)
+    vals = []
+    for p in parts:
+        p = p.strip()
+        if p:
+            vals.append(float(p))
+    return np.array(vals, dtype=float)
+
+
+def reg_fit_linear_model(x, y):
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = len(x)
+    X = np.column_stack([np.ones(n), x])
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ (X.T @ y)
+    intercept, slope = beta
+    y_fit = X @ beta
+    resid = y - y_fit
+    df = n - 2
+    s = np.sqrt(np.sum(resid**2) / df)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    ss_res = np.sum(resid**2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return {
+        "intercept": intercept,
+        "slope": slope,
+        "XtX_inv": XtX_inv,
+        "s": s,
+        "df": df,
+        "r2": r2,
+        "x": x,
+        "y": y,
+        "y_fit": y_fit,
+        "fitted": y_fit,
+        "resid": resid,
+    }
+
+
+def reg_predict_with_intervals(model, x_values, confidence=0.95, side="upper"):
+    x_values = np.asarray(x_values, dtype=float).ravel()
+    Xg = np.column_stack([np.ones(len(x_values)), x_values])
+    beta = np.array([model["intercept"], model["slope"]])
+    yhat = Xg @ beta
+    h = np.einsum("ij,jk,ik->i", Xg, model["XtX_inv"], Xg)
+    se_mean = model["s"] * np.sqrt(h)
+    se_pred = model["s"] * np.sqrt(1 + h)
+    alpha = 1 - confidence
+    if side == "two-sided":
+        tcrit = t.ppf(1 - alpha / 2, model["df"])
+    else:
+        tcrit = t.ppf(confidence, model["df"])
+    ci_lower = yhat - tcrit * se_mean
+    ci_upper = yhat + tcrit * se_mean
+    pi_lower = yhat - tcrit * se_pred
+    pi_upper = yhat + tcrit * se_pred
+    return pd.DataFrame({
+        "x": x_values,
+        "fit": yhat,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "pi_lower": pi_lower,
+        "pi_upper": pi_upper,
+    })
+
+
+def reg_find_crossing(xv, yv, limit):
+    d = yv - limit
+    idx = np.where(d[:-1] * d[1:] <= 0)[0]
+    if len(idx) == 0:
+        return None
+    i = idx[0]
+    x1, x2 = xv[i], xv[i + 1]
+    y1, y2 = yv[i], yv[i + 1]
+    if y2 == y1:
+        return x1
+    return x1 + (limit - y1) * (x2 - x1) / (y2 - y1)
+
+
+def plot_regression_advanced(
+    data_df,
+    model,
+    grid_df,
+    confidence=0.95,
+    interval="pi",
+    side="upper",
+    title="",
+    xlabel="Time",
+    ylabel="Response",
+    point_label="Data",
+    y_suffix="%",
+    spec_enabled=False,
+    spec_limit=None,
+    spec_label="US",
+    crossing_on="auto",
+):
+    x = data_df["x"].to_numpy()
+    y = data_df["y"].to_numpy()
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    ax.scatter(x, y, color=PRIMARY_COLOR, s=50, alpha=0.85, label=point_label, zorder=3)
+    ax.plot(grid_df["x"], grid_df["fit"], color="#2c3e50", lw=2, label="Fitted Line")
+
+    if interval in ["ci", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Confidence Interval (CI)")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.2)
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.2)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=BAND_COLOR, alpha=0.20, label="Upper CI")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=BAND_COLOR, alpha=0.20, label="Lower CI")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls="--", lw=1.3, label="_nolegend_")
+
+    if interval in ["pi", "both"]:
+        if side == "two-sided":
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Prediction Interval (PI)")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.2)
+        elif side == "upper":
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=0.13, label="Upper PI")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
+        else:
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=SECONDARY_COLOR, alpha=0.13, label="Lower PI")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=(0, (4, 4)), lw=1.3, label="_nolegend_")
+
+    crossing_x = None
+    if spec_enabled and spec_limit is not None:
+        ax.axhline(spec_limit, color="#27ae60", ls="--", lw=1.5, label=f"Limit ({spec_label})")
+        curve_map = {
+            "fit": grid_df["fit"].to_numpy(),
+            "ci_upper": grid_df["ci_upper"].to_numpy(),
+            "ci_lower": grid_df["ci_lower"].to_numpy(),
+            "pi_upper": grid_df["pi_upper"].to_numpy(),
+            "pi_lower": grid_df["pi_lower"].to_numpy(),
+        }
+        if crossing_on == "auto":
+            if interval in ["both", "pi"]:
+                crossing_on = "pi_upper" if side == "upper" else "pi_lower" if side == "lower" else "pi_upper"
+            else:
+                crossing_on = "ci_upper" if side == "upper" else "ci_lower" if side == "lower" else "ci_upper"
+        if crossing_on in curve_map:
+            crossing_x = reg_find_crossing(grid_df["x"].to_numpy(), curve_map[crossing_on], spec_limit)
+            if crossing_x is not None:
+                ax.axvline(crossing_x, color="#27ae60", ls=":", lw=1.5)
+                ymin, ymax = ax.get_ylim()
+                ax.text(
+                    crossing_x,
+                    ymin + 0.05 * (ymax - ymin),
+                    f" {crossing_x:.2f}",
+                    color="#27ae60",
+                    ha="left",
+                    va="bottom",
+                    fontsize=11,
+                    weight="bold",
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
+                )
+        xmin = grid_df["x"].min()
+        xmax = grid_df["x"].max()
+        ymax_data = max(grid_df["fit"].max(), grid_df["ci_upper"].max(), grid_df["pi_upper"].max(), y.max())
+        ymin_data = min(grid_df["fit"].min(), grid_df["ci_lower"].min(), grid_df["pi_lower"].min(), y.min())
+        pad = 0.02 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
+        suffix = y_suffix or ""
+        ax.text(
+            xmin + (xmax - xmin) * 0.02,
+            spec_limit + pad,
+            f"{spec_label} = {spec_limit:.1f}{suffix}",
+            ha="left",
+            va="bottom",
+            fontsize=11,
+            color="#27ae60",
+            weight="bold",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=3),
+        )
+
+    if y_suffix:
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{v:.1f}{y_suffix}"))
+
+    if not str(title).strip():
+        s1 = {"upper": "Upper One-Sided", "lower": "Lower One-Sided", "two-sided": "Two-Sided"}[side]
+        s2 = {"ci": "Confidence Intervals", "pi": "Prediction Intervals", "both": "Confidence and Prediction Intervals"}[interval]
+        title = f"{s1} {s2} ({confidence:.0%})"
+
+    ax.set_title(title, pad=12)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=GRID_ALPHA)
+    if SHOW_LEGEND:
+        ax.legend(frameon=False, loc=LEGEND_LOC)
+    fig.tight_layout()
+    return fig, crossing_x
+
+
 def estimate_shelf_life(model, limit, decreasing=True, confidence=0.95, x_upper=100):
     xg = np.linspace(0, x_upper, 1500)
     X0 = np.column_stack([np.ones(len(xg)), xg])
@@ -551,73 +748,184 @@ if app_selection == "01 - Descriptive Statistics":
 # App 02 Regression Intervals
 # -------------------------------------------------
 elif app_selection == "02 - Regression Intervals":
-    app_header("📈 App 02 - Regression Intervals", "Fit a linear regression model and generate confidence and prediction intervals with diagnostics.")
-    c1, c2 = st.columns([1.4, 1])
-    with c1:
-        xy_input = st.text_area("Paste X and Y data (with or without headers)", height=220)
-    with c2:
-        x_pred_text = st.text_area("X values for prediction (optional)")
-        conf = st.slider("Confidence level (%)", 80, 99, 95)
-        decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="reg_dec")
+    app_header("📈 App 02 - Regression Intervals", "Linear regression with CI / PI / both, one-sided or two-sided bands, prediction points, and spec-limit crossing.")
+
+    left, right = st.columns([1.45, 1])
+    with left:
+        xy_input = st.text_area("Paste X and Y data (two Excel columns, with or without headers)", height=220)
+    with right:
+        x_pred_text = st.text_area("Predict X (optional)", height=110, placeholder="Paste X values to predict")
 
     if xy_input:
         try:
-            df, x_label, y_label = parse_xy(xy_input)
-            x, y = df["x"].to_numpy(), df["y"].to_numpy()
-            model = fit_linear(x, y)
-            alpha = 1 - conf / 100
-            pred_x = parse_x_values(x_pred_text) if x_pred_text.strip() else x
-            pred = predict_intervals(model, pred_x, alpha)
-            pred = pred.merge(df.rename(columns={"x": "X", "y": "Actual Y"}), how="left", on="X")
-            pred = pred[["X", "Actual Y", "Fitted", "Lower CI", "Upper CI", "Lower PI", "Upper PI"]]
+            data_df, x_label_detected, y_label_detected = parse_xy(xy_input)
 
-            model_tbl = pd.DataFrame({
-                "Intercept": [model["intercept"]],
-                "Slope": [model["slope"]],
-                "Residual SD": [model["s"]],
-                "R²": [model["r2"]],
-                "N": [len(x)],
-            })
-            report_table(model_tbl, "Regression model summary", decimals)
-            report_table(pred, f"Predictions with {conf}% confidence and prediction intervals", decimals)
+            st.markdown("### Options")
+            c1, c2, c3 = st.columns([1, 1, 1.2])
+            with c1:
+                interval_mode = st.selectbox("Interval", ["ci", "pi", "both"], format_func=lambda x: {"ci":"CI", "pi":"PI", "both":"Both"}[x])
+            with c2:
+                side_mode = st.selectbox("Side", ["upper", "lower", "two-sided"], format_func=lambda x: {"upper":"Upper", "lower":"Lower", "two-sided":"Two-sided"}[x])
+            with c3:
+                confidence = st.slider("Confidence", 0.80, 0.99, 0.95, 0.01, format="%.2f")
 
-            xg = np.linspace(x.min(), x.max(), 220)
-            grid = predict_intervals(model, xg, alpha)
-            fig_main, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-            ax.scatter(x, y, color=PRIMARY_COLOR, s=46, label="Observed")
-            ax.plot(xg, grid["Fitted"], color="#111827", lw=2.2, label="Fit")
-            ax.fill_between(xg, grid["Lower CI"], grid["Upper CI"], color=BAND_COLOR, alpha=0.28, label=f"{conf}% CI")
-            ax.fill_between(xg, grid["Lower PI"], grid["Upper PI"], color=SECONDARY_COLOR, alpha=0.12, label=f"{conf}% PI")
-            apply_ax_style(ax, "Linear regression with intervals", x_label, y_label, legend=True)
-            st.pyplot(fig_main)
+            c4, c5, c6, c7 = st.columns([1.2, 1.1, 1.1, 0.9])
+            with c4:
+                plot_title = st.text_input("Title", value="")
+            with c5:
+                xlabel = st.text_input("X label", value=x_label_detected or "X")
+            with c6:
+                ylabel = st.text_input("Y label", value=y_label_detected or "Y")
+            with c7:
+                point_label = st.text_input("Point label", value="Data")
 
-            fig_res = residual_plot(model["fitted"], model["resid"], xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
-            st.pyplot(fig_res)
-            fig_qq = qq_plot(model["resid"], title="Normal probability plot of regression residuals")
-            st.pyplot(fig_qq)
+            c8, c9, c10, c11 = st.columns([0.9, 0.9, 0.9, 0.9])
+            with c8:
+                y_suffix = st.text_input("Y suffix", value="%")
+            with c9:
+                x_min_txt = st.text_input("X min", value="")
+            with c10:
+                default_xmax = str(max(40.0, float(max(data_df["x"].max(), reg_parse_prediction_points(x_pred_text).max()) if len(reg_parse_prediction_points(x_pred_text)) else float(data_df["x"].max()) * 1.15)))
+                x_max_txt = st.text_input("X max", value=default_xmax)
+            with c11:
+                decimals = st.slider("Decimals", 1, 8, DEFAULT_DECIMALS, key="reg_dec_refined")
 
-            conclusion = f"A simple linear regression was fitted to {len(x)} observations. The estimated slope was {model['slope']:.{decimals}f} and R² was {model['r2']:.{decimals}f}. Confidence intervals describe uncertainty in the mean fitted response, while prediction intervals describe the range for a future single observation."
-            export_results(
-                prefix="regression_intervals",
-                report_title="Statistical Analysis Report",
-                module_name="Regression Intervals",
-                statistical_analysis="A simple linear regression model was fitted to the pasted X and Y data. Model fit was summarized by the intercept, slope, residual standard deviation, and coefficient of determination (R²). Confidence intervals for the fitted mean response and prediction intervals for future observations were then calculated using the t distribution.",
-                offer_text="This analysis offers a direct way to quantify linear trends, estimate expected response values at selected X points, compare observed values against fitted values, and distinguish between uncertainty in the mean response and dispersion of individual future values.",
-                python_tools="Python tools used here include pandas and numpy for handling pasted data and matrix calculations, scipy.stats for t-based interval calculations and probability plotting, matplotlib for regression and residual figures, openpyxl for Excel export, and reportlab for the PDF-style report.",
-                table_map={"Model Summary": model_tbl, "Predictions": pred},
-                figure_map={
-                    "Regression with confidence and prediction intervals": fig_to_png_bytes(fig_main),
-                    "Residuals vs fitted": fig_to_png_bytes(fig_res),
-                    "Normal probability plot": fig_to_png_bytes(fig_qq),
-                },
-                conclusion=conclusion,
-                decimals=decimals,
-            )
+            st.markdown("### Specification / crossing")
+            s1, s2, s3, s4 = st.columns([0.9, 1, 1, 1.2])
+            with s1:
+                spec_enabled = st.checkbox("Use spec limit", value=True)
+            with s2:
+                spec_value_txt = st.text_input("Spec value", value="3.0", disabled=not spec_enabled)
+            with s3:
+                spec_label = st.text_input("Spec label", value="US", disabled=not spec_enabled)
+            with s4:
+                crossing_on = st.selectbox(
+                    "Crossing on",
+                    ["auto", "fit", "ci_upper", "ci_lower", "pi_upper", "pi_lower"],
+                    format_func=lambda x: {
+                        "auto": "Auto", "fit": "Fit", "ci_upper": "CI upper", "ci_lower": "CI lower", "pi_upper": "PI upper", "pi_lower": "PI lower"
+                    }[x],
+                    disabled=not spec_enabled,
+                )
+
+            if st.button("Run regression analysis", type="primary"):
+                pred_x = reg_parse_prediction_points(x_pred_text)
+                x_all_max = data_df["x"].max()
+                if len(pred_x) > 0:
+                    x_all_max = max(x_all_max, np.max(pred_x))
+
+                def parse_optional_float(txt):
+                    txt = str(txt).strip()
+                    return None if txt == "" else float(txt)
+
+                x_min = parse_optional_float(x_min_txt)
+                x_max = parse_optional_float(x_max_txt)
+                if x_min is None:
+                    x_min = min(0.0, float(data_df["x"].min()))
+                if x_max is None:
+                    x_max = x_all_max * 1.15 if x_all_max != 0 else 1.0
+                if x_max <= x_min:
+                    raise ValueError("X max must be greater than X min.")
+
+                grid_x = np.linspace(x_min, x_max, 500)
+                model = reg_fit_linear_model(data_df["x"], data_df["y"])
+                grid_df = reg_predict_with_intervals(model, grid_x, confidence=confidence, side=side_mode)
+
+                fig_main, crossing_x = plot_regression_advanced(
+                    data_df=data_df,
+                    model=model,
+                    grid_df=grid_df,
+                    confidence=confidence,
+                    interval=interval_mode,
+                    side=side_mode,
+                    title=plot_title,
+                    xlabel=xlabel,
+                    ylabel=ylabel,
+                    point_label=point_label,
+                    y_suffix=y_suffix,
+                    spec_enabled=spec_enabled,
+                    spec_limit=parse_optional_float(spec_value_txt) if spec_enabled else None,
+                    spec_label=spec_label,
+                    crossing_on=crossing_on,
+                )
+                st.pyplot(fig_main)
+
+                summary_tbl = pd.DataFrame({
+                    "Intercept": [model["intercept"]],
+                    "Slope": [model["slope"]],
+                    "R²": [model["r2"]],
+                    "Residual SD (s)": [model["s"]],
+                    "Degrees of Freedom": [model["df"]],
+                })
+                if crossing_x is not None:
+                    summary_tbl["Crossing Point"] = [crossing_x]
+                report_table(summary_tbl, "Regression model summary", decimals)
+
+                report_table(data_df.rename(columns={"x": "X Value", "y": "Actual Y"}), "Table 1: Parsed input data", decimals)
+
+                new_pred_x = np.setdiff1d(pred_x, data_df["x"].to_numpy()) if len(pred_x) > 0 else np.array([])
+                if len(new_pred_x) > 0:
+                    new_pts_df = pd.DataFrame({"x": new_pred_x, "y": np.nan})
+                    combined_pts_df = pd.concat([data_df[["x", "y"]], new_pts_df], ignore_index=True)
+                else:
+                    combined_pts_df = data_df[["x", "y"]].copy()
+                combined_pts_df = combined_pts_df.sort_values("x").reset_index(drop=True)
+                unique_x = combined_pts_df["x"].unique()
+                intervals_df = reg_predict_with_intervals(model, unique_x, confidence=confidence, side=side_mode)
+                final_table_df = pd.merge(combined_pts_df, intervals_df, on="x", how="left")
+                final_table_df = final_table_df[[c for c in ["x", "y", "fit", "ci_lower", "ci_upper", "pi_lower", "pi_upper"] if c in final_table_df.columns]]
+                final_table_df.columns = ["X Value", "Actual Y", "Fitted Y", "Lower CI", "Upper CI", "Lower PI", "Upper PI"]
+                report_table(final_table_df, "Table 2: Fitted values and intervals", decimals)
+
+                fig_res = residual_plot(model["fitted"], model["resid"], xlabel="Fitted values", ylabel="Residuals", title="Residuals vs fitted")
+                st.pyplot(fig_res)
+                fig_qq = qq_plot(model["resid"], title="Normal probability plot of regression residuals")
+                st.pyplot(fig_qq)
+
+                crossing_text = f" A crossing with the selected specification limit was identified at x = {crossing_x:.{decimals}f}." if crossing_x is not None else " No crossing with the selected specification limit was identified in the displayed X range."
+                conclusion = (
+                    f"A simple linear regression was fitted to {len(data_df)} observations. "
+                    f"The fitted equation was y = {model['intercept']:.{decimals}f} + {model['slope']:.{decimals}f} × x, "
+                    f"with R² = {model['r2']:.{decimals}f} and residual SD = {model['s']:.{decimals}f}. "
+                    f"The analysis displayed {('confidence intervals' if interval_mode == 'ci' else 'prediction intervals' if interval_mode == 'pi' else 'both confidence and prediction intervals')} using a {side_mode} setting at {confidence:.0%} confidence." + crossing_text
+                )
+                export_results(
+                    prefix="regression_intervals_refined",
+                    report_title="Statistical Analysis Report",
+                    module_name="Regression Intervals",
+                    statistical_analysis=(
+                        "A simple linear regression model was fitted to the pasted X and Y data using ordinary least squares. "
+                        "The analysis estimates the intercept and slope of the linear relationship, summarizes goodness of fit using R² and residual standard deviation, "
+                        "and then calculates confidence intervals for the fitted mean response and prediction intervals for future observations. "
+                        "The module also allows one-sided or two-sided interval construction and can estimate a crossing point against a user-defined specification limit."
+                    ),
+                    offer_text=(
+                        "This analysis offers a practical way to evaluate linear trends over X, quantify the expected response at user-selected X values, "
+                        "compare observed responses with fitted values, and distinguish between uncertainty in the average response and variability expected for individual future measurements. "
+                        "When a specification limit is supplied, it can also estimate where the fitted curve or selected interval band crosses that limit."
+                    ),
+                    python_tools=(
+                        "Python tools used here include pandas for parsing pasted Excel-style data, numpy for matrix algebra and grid generation, "
+                        "scipy.stats for t-based interval calculations, matplotlib for the fitted-curve, residual, and normal probability plots, "
+                        "openpyxl for Excel export, and reportlab for the PDF-style report."
+                    ),
+                    table_map={
+                        "Regression Model Summary": summary_tbl,
+                        "Parsed Input Data": data_df.rename(columns={"x": "X Value", "y": "Actual Y"}),
+                        "Fitted Values and Intervals": final_table_df,
+                    },
+                    figure_map={
+                        "Regression plot": fig_to_png_bytes(fig_main),
+                        "Residuals vs fitted": fig_to_png_bytes(fig_res),
+                        "Normal probability plot": fig_to_png_bytes(fig_qq),
+                    },
+                    conclusion=conclusion,
+                    decimals=decimals,
+                )
         except Exception as e:
             st.error(str(e))
 
 
-# -------------------------------------------------
 # App 03 Shelf Life Estimator
 # -------------------------------------------------
 elif app_selection == "03 - Shelf Life Estimator":
