@@ -239,6 +239,16 @@ PRIMARY_COLOR = _ALL_CFG["primary_color"]
 SECONDARY_COLOR = _ALL_CFG["secondary_color"]
 BAND_COLOR = _ALL_CFG["band_color"]
 GRID_ALPHA = _ALL_CFG["grid_alpha"]
+# Compatibility globals for refined plotting modules
+MARKER_SIZE = _ALL_CFG["marker_size"]
+FIT_LINE_COLOR = _ALL_CFG["primary_color"]
+FIT_LINE_STYLE = _ALL_CFG["line_style"]
+LINE_WIDTH = _ALL_CFG["line_width"]
+AREA_ALPHA = 0.18
+CI_LINE_STYLE = _ALL_CFG["aux_line_style"]
+PI_LINE_STYLE = _ALL_CFG["aux_line_style"]
+SPEC_LINE_STYLE = _ALL_CFG["aux_line_style"]
+ARROW_SIZE = _ALL_CFG["arrow_size"]
 
 st.sidebar.divider()
 st.sidebar.info("Paste data from Excel. Tables, charts, Excel exports, and PDF-style reports are built into the app. Exported figures keep the current display settings.")
@@ -449,39 +459,49 @@ def plot_regression_advanced(
     spec_label="US",
     crossing_on="auto",
 ):
+    cfg = get_plot_cfg("Regression intervals")
     x = data_df["x"].to_numpy()
     y = data_df["y"].to_numpy()
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-    ax.scatter(x, y, color=PRIMARY_COLOR, s=MARKER_SIZE, alpha=0.85, label=point_label, zorder=3)
-    ax.plot(grid_df["x"], grid_df["fit"], color=FIT_LINE_COLOR, lw=LINE_WIDTH, ls=FIT_LINE_STYLE, label="Fitted Line")
+    fig, ax = plt.subplots(figsize=(cfg["fig_w"], cfg["fig_h"]))
+    main_color = cfg["primary_color"]
+    pi_color = cfg["secondary_color"]
+    ci_color = cfg["band_color"]
+    lw = cfg["line_width"]
+    ls = cfg["line_style"]
+    aux_ls = cfg["aux_line_style"]
+    ms = cfg["marker_size"]
+    area_alpha = 0.18
+    ax.scatter(x, y, color=main_color, s=ms, alpha=0.85, label=point_label, zorder=3)
+    ax.plot(grid_df["x"], grid_df["fit"], color=main_color, lw=lw, ls=ls, label="Fitted Line")
 
     if interval in ["ci", "both"]:
         if side == "two-sided":
-            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Confidence Interval (CI)")
-            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8)
-            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["ci_upper"], color=ci_color, alpha=area_alpha, label="Confidence Interval (CI)")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=ci_color, ls=aux_ls, lw=cfg["aux_line_width"])
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=ci_color, ls=aux_ls, lw=cfg["aux_line_width"])
         elif side == "upper":
-            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Upper CI")
-            ax.plot(grid_df["x"], grid_df["ci_upper"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["ci_upper"], color=ci_color, alpha=area_alpha, label="Upper CI")
+            ax.plot(grid_df["x"], grid_df["ci_upper"], color=ci_color, ls=aux_ls, lw=cfg["aux_line_width"], label="_nolegend_")
         else:
-            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=BAND_COLOR, alpha=AREA_ALPHA, label="Lower CI")
-            ax.plot(grid_df["x"], grid_df["ci_lower"], color=BAND_COLOR, ls=CI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+            ax.fill_between(grid_df["x"], grid_df["ci_lower"], grid_df["fit"], color=ci_color, alpha=area_alpha, label="Lower CI")
+            ax.plot(grid_df["x"], grid_df["ci_lower"], color=ci_color, ls=aux_ls, lw=cfg["aux_line_width"], label="_nolegend_")
 
     if interval in ["pi", "both"]:
+        pa = max(area_alpha - 0.05, 0.05)
         if side == "two-sided":
-            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Prediction Interval (PI)")
-            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8)
-            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8)
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["pi_upper"], color=pi_color, alpha=pa, label="Prediction Interval (PI)")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=pi_color, ls=aux_ls, lw=cfg["aux_line_width"])
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=pi_color, ls=aux_ls, lw=cfg["aux_line_width"])
         elif side == "upper":
-            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Upper PI")
-            ax.plot(grid_df["x"], grid_df["pi_upper"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+            ax.fill_between(grid_df["x"], grid_df["fit"], grid_df["pi_upper"], color=pi_color, alpha=pa, label="Upper PI")
+            ax.plot(grid_df["x"], grid_df["pi_upper"], color=pi_color, ls=aux_ls, lw=cfg["aux_line_width"], label="_nolegend_")
         else:
-            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=SECONDARY_COLOR, alpha=max(AREA_ALPHA-0.05,0.05), label="Lower PI")
-            ax.plot(grid_df["x"], grid_df["pi_lower"], color=SECONDARY_COLOR, ls=PI_LINE_STYLE, lw=LINE_WIDTH*0.8, label="_nolegend_")
+            ax.fill_between(grid_df["x"], grid_df["pi_lower"], grid_df["fit"], color=pi_color, alpha=pa, label="Lower PI")
+            ax.plot(grid_df["x"], grid_df["pi_lower"], color=pi_color, ls=aux_ls, lw=cfg["aux_line_width"], label="_nolegend_")
 
     crossing_x = None
     if spec_enabled and spec_limit is not None:
-        ax.axhline(spec_limit, color="#27ae60", ls=SPEC_LINE_STYLE, lw=LINE_WIDTH, label=f"Limit ({spec_label})")
+        ax.axhline(spec_limit, color=cfg["tertiary_color"], ls=aux_ls, lw=lw, label=f"Limit ({spec_label})")
         curve_map = {
             "fit": grid_df["fit"].to_numpy(),
             "ci_upper": grid_df["ci_upper"].to_numpy(),
@@ -497,7 +517,7 @@ def plot_regression_advanced(
         if crossing_on in curve_map:
             crossing_x = reg_find_crossing(grid_df["x"].to_numpy(), curve_map[crossing_on], spec_limit)
             if crossing_x is not None:
-                ax.axvline(crossing_x, color="#27ae60", ls=SPEC_LINE_STYLE, lw=LINE_WIDTH*0.8)
+                ax.axvline(crossing_x, color=cfg["tertiary_color"], ls=aux_ls, lw=cfg["aux_line_width"])
         xmin = float(grid_df["x"].min())
         xmax = float(grid_df["x"].max())
         ymax_data = max(float(grid_df["fit"].max()), float(grid_df["ci_upper"].max()), float(grid_df["pi_upper"].max()), float(y.max()))
@@ -505,11 +525,11 @@ def plot_regression_advanced(
         pad = 0.02 * (ymax_data - ymin_data if ymax_data > ymin_data else 1)
         suffix = y_suffix or ""
         ax.text(xmin + (xmax - xmin) * 0.02, spec_limit + pad, f"{spec_label} = {spec_limit:.1f}{suffix}",
-                ha="left", va="bottom", fontsize=11, color="#27ae60", weight="bold",
+                ha="left", va="bottom", fontsize=11, color=cfg["tertiary_color"], weight="bold",
                 bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2))
         if crossing_x is not None:
             ax.text(crossing_x, ymin_data + pad, f" {crossing_x:.2f}",
-                    color="#27ae60", ha="left", va="bottom", fontsize=11, weight="bold",
+                    color=cfg["tertiary_color"], ha="left", va="bottom", fontsize=11, weight="bold",
                     bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2))
 
     if y_suffix:
@@ -520,7 +540,7 @@ def plot_regression_advanced(
         s2 = {"ci": "Confidence Intervals", "pi": "Prediction Intervals", "both": "Confidence and Prediction Intervals"}[interval]
         title = f"{s1} {s2} ({confidence:.0%})"
 
-    apply_ax_style(ax, title, xlabel, ylabel, legend=True)
+    apply_ax_style(ax, title, xlabel, ylabel, legend=True, plot_key="Regression intervals")
     return fig, crossing_x
 
 
@@ -693,7 +713,7 @@ def apply_ax_style(ax, title, xlabel, ylabel, legend=None, plot_key="All graphs"
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.grid(alpha=cfg["grid_alpha"])
+    ax.grid(True, alpha=cfg["grid_alpha"])
     ax.tick_params(direction=cfg["tick_dir"], length=cfg["tick_len"], width=cfg["border_width"])
     ax.spines["left"].set_linewidth(cfg["border_width"])
     ax.spines["bottom"].set_linewidth(cfg["border_width"])
@@ -770,6 +790,7 @@ def tolerance_interval_normal(data, p=0.95, conf=0.95, two_sided=True):
 
 
 def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, facecolor=None, plot_key="PCA score plot"):
+    scores = np.asarray(scores, dtype=float)
     if scores.shape[0] < 3:
         return
     cov = np.cov(scores.T)
@@ -780,7 +801,7 @@ def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, facecolor=None, plot_
     q = stats.chi2.ppf(0.95, 2)
     width, height = 2 * np.sqrt(vals * q)
     cfg = get_plot_cfg(plot_key)
-    lw = cfg["aux_line_width"]
+    lw = max(0.8, cfg["aux_line_width"] * 0.9)
     ls = cfg["aux_line_style"]
     fc = facecolor if facecolor is not None else edgecolor
     ell = Ellipse(
@@ -790,21 +811,10 @@ def draw_conf_ellipse(scores, ax, edgecolor=PRIMARY_COLOR, facecolor=None, plot_
         angle=theta,
         edgecolor=edgecolor,
         facecolor=fc,
-        alpha=0.15,
+        alpha=0.12,
         lw=lw,
         ls=ls,
     )
-    ax.add_patch(ell)
-
-    if scores.shape[0] < 3:
-        return
-    cov = np.cov(scores[:, 0], scores[:, 1])
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = eigvals.argsort()[::-1]
-    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
-    angle = np.degrees(np.arctan2(*eigvecs[:, 0][::-1]))
-    width, height = 2 * np.sqrt(5.991 * eigvals)
-    ell = Ellipse(scores.mean(axis=0), width, height, angle=angle, fill=False, lw=2, edgecolor=edgecolor)
     ax.add_patch(ell)
 
 
@@ -1142,7 +1152,8 @@ if app_selection == "01 - Descriptive Statistics":
                         test_candidates = [c for c in numeric_cols if c != ref_col]
                         test_col = st.selectbox("Test column", test_candidates, index=0)
 
-                if st.button("Run descriptive statistics", type="primary"):
+                auto_run_desc = True
+            if auto_run_desc:
                     ref = to_numeric(df[ref_col]).dropna().to_numpy()
                     if len(ref) < 3:
                         st.error("Reference column must contain at least 3 numeric values.")
@@ -1358,7 +1369,8 @@ elif app_selection == "02 - Regression Intervals":
                     disabled=not spec_enabled,
                 )
 
-            if st.button("Run regression analysis", type="primary"):
+            auto_run_reg = True
+            if auto_run_reg:
                 pred_x = parse_x_values(x_pred_text)
                 x_all_max = data_df["x"].max()
                 if len(pred_x) > 0:
